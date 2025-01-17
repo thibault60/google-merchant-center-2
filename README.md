@@ -1,0 +1,1 @@
+# google-merchant-center-2
