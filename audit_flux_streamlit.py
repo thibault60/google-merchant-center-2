@@ -1,4 +1,3 @@
-# Chemin principal
 import streamlit as st
 import requests
 import xml.etree.ElementTree as ET
@@ -44,13 +43,12 @@ def parse_xml(content):
         st.error(f"Erreur lors du parsing XML : {e}")
         return None
 
-# Extraire les titres et descriptions des produits
+# Extraire les titres et descriptions basés sur <title> et <description>
 def extract_titles_and_descriptions(root):
-    namespace = {"g": "http://base.google.com/ns/1.0"}
     data = []
-    for item in root.findall(".//item", namespace):
-        title = item.find("g:title", namespace)
-        description = item.find("g:description", namespace)
+    for item in root.findall(".//item"):
+        title = item.find("title")
+        description = item.find("description")
         data.append({
             'title': title.text if title is not None else "MISSING",
             'description': description.text if description is not None else "MISSING",
