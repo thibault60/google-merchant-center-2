@@ -5,7 +5,6 @@ from openpyxl import Workbook
 from openpyxl.styles import Font
 from io import BytesIO
 import re
-from collections import Counter
 
 # Injecter du CSS personnalisé
 def add_custom_css():
@@ -84,17 +83,17 @@ def validate_products(products):
 
     for product in products:
         product_errors = {
-            'duplicate_id': product['id'] in seen_ids,
-            'invalid_or_missing_price': product.get('price', 'MISSING') == "MISSING" or not price_pattern.match(product.get('price', '')),
-            'null_price': product.get('price', '').startswith("0"),
-            'missing_title': product.get('title', 'MISSING') == "MISSING",
-            'description_missing_or_short': len(product.get('description', '')) < 20,
-            'invalid_availability': product.get('availability', 'MISSING') == "MISSING",
-            'missing_or_empty_color': product.get('color', 'MISSING') == "MISSING",
-            'missing_or_empty_gender': product.get('gender', 'MISSING') == "MISSING",
-            'missing_or_empty_size': product.get('size', 'MISSING') == "MISSING",
-            'missing_or_empty_age_group': product.get('age_group', 'MISSING') == "MISSING",
-            'missing_or_empty_image_link': product.get('image_link', 'MISSING') == "MISSING",
+            'duplicate_id': "Erreur" if product['id'] in seen_ids else "OK",
+            'invalid_or_missing_price': "Erreur" if product.get('price', 'MISSING') == "MISSING" or not price_pattern.match(product.get('price', '')) else "OK",
+            'null_price': "Erreur" if product.get('price', '').startswith("0") else "OK",
+            'missing_title': "Erreur" if product.get('title', 'MISSING') == "MISSING" else "OK",
+            'description_missing_or_short': "Erreur" if len(product.get('description', '')) < 20 else "OK",
+            'invalid_availability': "Erreur" if product.get('availability', 'MISSING') == "MISSING" else "OK",
+            'missing_or_empty_color': "Erreur" if product.get('color', 'MISSING') == "MISSING" else "OK",
+            'missing_or_empty_gender': "Erreur" if product.get('gender', 'MISSING') == "MISSING" else "OK",
+            'missing_or_empty_size': "Erreur" if product.get('size', 'MISSING') == "MISSING" else "OK",
+            'missing_or_empty_age_group': "Erreur" if product.get('age_group', 'MISSING') == "MISSING" else "OK",
+            'missing_or_empty_image_link': "Erreur" if product.get('image_link', 'MISSING') == "MISSING" else "OK",
         }
         errors.append({**product, **product_errors})
         seen_ids.add(product['id'])
@@ -108,7 +107,7 @@ def generate_excel(data):
     sheet.title = "Validation Results"
 
     headers = [
-        "Product ID", "Title", "Product URL", "Color", "Gender", "Size", "Age Group", "Image Link",
+        "Product ID", "Title", "Description", "Product URL", "Color", "Gender", "Size", "Age Group", "Image Link",
         "Duplicate ID", "Invalid or Missing Price", "Prix nul", "Missing Title",
         "Description Missing or Too Short", "Invalid Availability", "Missing or Empty Color",
         "Missing or Empty Gender", "Missing or Empty Size", "Missing or Empty Age Group",
@@ -118,8 +117,8 @@ def generate_excel(data):
 
     for product in data:
         sheet.append([
-            product['id'], product['title'], product['product_url'], product['color'], product['gender'],
-            product['size'], product['age_group'], product['image_link'],
+            product['id'], product['title'], product['description'], product['product_url'], product['color'],
+            product['gender'], product['size'], product['age_group'], product['image_link'],
             product['duplicate_id'], product['invalid_or_missing_price'], product['null_price'],
             product['missing_title'], product['description_missing_or_short'], product['invalid_availability'],
             product['missing_or_empty_color'], product['missing_or_empty_gender'], product['missing_or_empty_size'],
