@@ -54,21 +54,22 @@ def analyze_products(root):
         product = {
             'id': item.find("g:id", namespace).text if item.find("g:id", namespace) is not None else "MISSING",
             'title': (
-                item.find("g:title", namespace).text
-                if item.find("g:title", namespace) is not None
-                else (item.find("title").text if item.find("title") is not None else "MISSING")
+                item.find("g:title", namespace).text if item.find("g:title", namespace) is not None else
+                item.find("title").text if item.find("title") is not None else "MISSING"
             ),
-            'product_url': item.find("g:link", namespace).text if item.find("g:link", namespace) is not None else "MISSING",
+            'description': (
+                item.find("g:description", namespace).text if item.find("g:description", namespace) is not None else
+                item.find("description").text if item.find("description") is not None else "MISSING"
+            ),
+            'product_url': (
+                item.find("g:link", namespace).text if item.find("g:link", namespace) is not None else
+                item.find("link").text if item.find("link") is not None else "MISSING"
+            ),
             'color': item.find("g:color", namespace).text if item.find("g:color", namespace) is not None else "MISSING",
             'gender': item.find("g:gender", namespace).text if item.find("g:gender", namespace) is not None else "MISSING",
             'size': item.find("g:size", namespace).text if item.find("g:size", namespace) is not None else "MISSING",
             'age_group': item.find("g:age_group", namespace).text if item.find("g:age_group", namespace) is not None else "MISSING",
             'image_link': item.find("g:image_link", namespace).text if item.find("g:image_link", namespace) is not None else "MISSING",
-            'description': (
-                item.find("g:description", namespace).text
-                if item.find("g:description", namespace) is not None
-                else (item.find("description").text if item.find("description") is not None else "MISSING")
-            ),
             'price': item.find("g:price", namespace).text if item.find("g:price", namespace) is not None else "MISSING",
             'availability': item.find("g:availability", namespace).text if item.find("g:availability", namespace) is not None else "MISSING",
         }
