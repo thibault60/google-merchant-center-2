@@ -1,11 +1,11 @@
 import streamlit as st
 import requests
 import xml.etree.ElementTree as ET
-from collections import Counter
 from openpyxl import Workbook
-from openpyxl.styles import Font, Alignment
+from openpyxl.styles import Font
 from io import BytesIO
-import re  # Pour valider le format du prix avec devise
+import re
+from collections import Counter
 
 # Injecter du CSS personnalisé
 def add_custom_css():
@@ -27,7 +27,7 @@ def add_custom_css():
         unsafe_allow_html=True,
     )
 
-# Étape 1 : Télécharger le flux XML depuis l'URL
+# Étape 1 : Télécharger le flux XML
 def fetch_xml(url):
     try:
         response = requests.get(url)
@@ -37,7 +37,7 @@ def fetch_xml(url):
         st.error(f"Erreur lors du téléchargement du flux : {e}")
         return None
 
-# Étape 2 : Parser le contenu XML avec gestion des espaces de noms
+# Étape 2 : Parser le contenu XML
 def parse_xml(content):
     try:
         root = ET.fromstring(content)
@@ -46,7 +46,7 @@ def parse_xml(content):
         st.error(f"Erreur lors du parsing XML : {e}")
         return None
 
-# Étape 3 : Analyser les données des produits
+# Étape 3 : Analyser les produits
 def analyze_products(root):
     namespace = {"g": "http://base.google.com/ns/1.0"}
     products = []
@@ -54,61 +54,77 @@ def analyze_products(root):
         product = {
             'id': item.find("g:id", namespace).text if item.find("g:id", namespace) is not None else "MISSING",
             'title': item.find("g:title", namespace).text if item.find("g:title", namespace) is not None else "MISSING",
+            'product_url': item.find("g:link", namespace).text if item.find("g:link", namespace) is not None else "MISSING",
+            'color': item.find("g:color", namespace).text if item.find("g:color", namespace) is not None else "MISSING",
+            'gender': item.find("g:gender", namespace).text if item.find("g:gender", namespace) is not None else "MISSING",
+            'size': item.find("g:size", namespace).text if item.find("g:size", namespace) is not None else "MISSING",
+            'age_group': item.find("g:age_group", namespace).text if item.find("g:age_group", namespace) is not None else "MISSING",
+            'image_link': item.find("g:image_link", namespace).text if item.find("g:image_link", namespace) is not None else "MISSING",
             'description': item.find("g:description", namespace).text if item.find("g:description", namespace) is not None else "MISSING",
             'price': item.find("g:price", namespace).text if item.find("g:price", namespace) is not None else "MISSING",
             'availability': item.find("g:availability", namespace).text if item.find("g:availability", namespace) is not None else "MISSING",
-            'condition': item.find("g:condition", namespace).text if item.find("g:condition", namespace) is not None else "MISSING",
-            'brand': item.find("g:brand", namespace).text if item.find("g:brand", namespace) is not None else "MISSING",
-            'gtin': item.find("g:gtin", namespace).text if item.find("g:gtin", namespace) is not None else "MISSING",
-            'mpn': item.find("g:mpn", namespace).text if item.find("g:mpn", namespace) is not None else "MISSING",
-            'color': item.find("g:color", namespace).text if item.find("g:color", namespace) is not None else "MISSING",
-            'size': item.find("g:size", namespace).text if item.find("g:size", namespace) is not None else "MISSING",
-            'age_group': item.find("g:age_group", namespace).text if item.find("g:age_group", namespace) is not None else "MISSING",
-            'gender': item.find("g:gender", namespace).text if item.find("g:gender", namespace) is not None else "MISSING",
-            'item_group_id': item.find("g:item_group_id", namespace).text if item.find("g:item_group_id", namespace) is not None else "MISSING",
-            'shipping': item.find("g:shipping", namespace).text if item.find("g:shipping", namespace) is not None else "MISSING",
-            'shipping_weight': item.find("g:shipping_weight", namespace).text if item.find("g:shipping_weight", namespace) is not None else "MISSING",
-            'pattern': item.find("g:pattern", namespace).text if item.find("g:pattern", namespace) is not None else "MISSING",
-            'material': item.find("g:material", namespace).text if item.find("g:material", namespace) is not None else "MISSING",
-            'additional_image_link': item.find("g:additional_image_link", namespace).text if item.find("g:additional_image_link", namespace) is not None else "MISSING",
-            'size_type': item.find("g:size_type", namespace).text if item.find("g:size_type", namespace) is not None else "MISSING",
-            'size_system': item.find("g:size_system", namespace).text if item.find("g:size_system", namespace) is not None else "MISSING",
-            'canonical_link': item.find("g:canonical_link", namespace).text if item.find("g:canonical_link", namespace) is not None else "MISSING",
-            'expiration_date': item.find("g:expiration_date", namespace).text if item.find("g:expiration_date", namespace) is not None else "MISSING",
-            'sale_price': item.find("g:sale_price", namespace).text if item.find("g:sale_price", namespace) is not None else "MISSING",
-            'sale_price_effective_date': item.find("g:sale_price_effective_date", namespace).text if item.find("g:sale_price_effective_date", namespace) is not None else "MISSING",
-            'product_highlight': item.find("g:product_highlight", namespace).text if item.find("g:product_highlight", namespace) is not None else "MISSING",
-            'ships_from_country': item.find("g:ships_from_country", namespace).text if item.find("g:ships_from_country", namespace) is not None else "MISSING",
-            'max_handling_time': item.find("g:max_handling_time", namespace).text if item.find("g:max_handling_time", namespace) is not None else "MISSING",
-            'availability_date': item.find("g:availability_date", namespace).text if item.find("g:availability_date", namespace) is not None else "MISSING"
         }
         products.append(product)
     return products
 
-# Étape 4 : Validation des données
+# Étape 4 : Validation des produits
 def validate_products(products):
     errors = []
     price_pattern = re.compile(r"^\d+(\.\d{1,2})?( [A-Z]{3})?$")  # Accepte les prix avec devise (ex: "44.99 EUR")
+    seen_ids = set()
 
     for product in products:
-        if product.get('id', 'MISSING') == "MISSING":
-            errors.append(("Missing ID", product.get('id', 'MISSING')))
-        if product.get('title', 'MISSING') == "MISSING":
-            errors.append(("Missing Title", product.get('id', 'MISSING')))
-        if product.get('product_url', 'MISSING') == "MISSING":
-            errors.append(("Missing Product URL", product.get('id', 'MISSING')))
-        if product.get('image_link', 'MISSING') == "MISSING":
-            errors.append(("Missing Image Link", product.get('id', 'MISSING')))
-        if product.get('price', 'MISSING') == "MISSING" or not price_pattern.match(product.get('price', '')):
-            errors.append(("Invalid or Missing Price", product.get('id', 'MISSING')))
-        if product.get('condition', 'MISSING') == "MISSING":
-            errors.append(("Missing Condition", product.get('id', 'MISSING')))
-        if product.get('brand', 'MISSING') == "MISSING":
-            errors.append(("Missing Brand", product.get('id', 'MISSING')))
-        if product.get('color', 'MISSING') == "MISSING" or product.get('size', 'MISSING') == "MISSING" or product.get('gender', 'MISSING') == "MISSING":
-            errors.append(("Missing Clothing Attributes", product.get('id', 'MISSING')))
+        product_errors = {
+            'duplicate_id': product['id'] in seen_ids,
+            'invalid_or_missing_price': product.get('price', 'MISSING') == "MISSING" or not price_pattern.match(product.get('price', '')),
+            'null_price': product.get('price', '').startswith("0"),
+            'missing_title': product.get('title', 'MISSING') == "MISSING",
+            'description_missing_or_short': len(product.get('description', '')) < 20,
+            'invalid_availability': product.get('availability', 'MISSING') == "MISSING",
+            'missing_or_empty_color': product.get('color', 'MISSING') == "MISSING",
+            'missing_or_empty_gender': product.get('gender', 'MISSING') == "MISSING",
+            'missing_or_empty_size': product.get('size', 'MISSING') == "MISSING",
+            'missing_or_empty_age_group': product.get('age_group', 'MISSING') == "MISSING",
+            'missing_or_empty_image_link': product.get('image_link', 'MISSING') == "MISSING",
+        }
+        errors.append({**product, **product_errors})
+        seen_ids.add(product['id'])
 
-    return errors, products
+    return errors
+
+# Étape 5 : Générer le fichier Excel
+def generate_excel(data):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Validation Results"
+
+    headers = [
+        "Product ID", "Title", "Product URL", "Color", "Gender", "Size", "Age Group", "Image Link",
+        "Duplicate ID", "Invalid or Missing Price", "Prix nul", "Missing Title",
+        "Description Missing or Too Short", "Invalid Availability", "Missing or Empty Color",
+        "Missing or Empty Gender", "Missing or Empty Size", "Missing or Empty Age Group",
+        "Missing or Empty Image Link"
+    ]
+    sheet.append(headers)
+
+    for product in data:
+        sheet.append([
+            product['id'], product['title'], product['product_url'], product['color'], product['gender'],
+            product['size'], product['age_group'], product['image_link'],
+            product['duplicate_id'], product['invalid_or_missing_price'], product['null_price'],
+            product['missing_title'], product['description_missing_or_short'], product['invalid_availability'],
+            product['missing_or_empty_color'], product['missing_or_empty_gender'], product['missing_or_empty_size'],
+            product['missing_or_empty_age_group'], product['missing_or_empty_image_link']
+        ])
+
+    for col in sheet.iter_cols(min_row=1, max_row=1, min_col=1, max_col=len(headers)):
+        for cell in col:
+            cell.font = Font(bold=True)
+
+    excel_data = BytesIO()
+    workbook.save(excel_data)
+    excel_data.seek(0)
+    return excel_data
 
 # Fonction principale
 def main():
@@ -130,12 +146,16 @@ def main():
             root = parse_xml(content)
             if root:
                 products = analyze_products(root)
-                errors, validated_products = validate_products(products)
+                validated_products = validate_products(products)
+                excel_file = generate_excel(validated_products)
 
-                st.write(f"Nombre total de produits analysés : {len(products)}")
-                st.write(f"Nombre total d'erreurs : {len(errors)}")
-                for error_type, count in Counter([e[0] for e in errors]).items():
-                    st.write(f"- {error_type}: {count}")
+                st.success("Audit terminé. Téléchargez le fichier Excel ci-dessous :")
+                st.download_button(
+                    label="Télécharger le fichier Excel",
+                    data=excel_file,
+                    file_name="audit_flux_google_merchant.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
 
 if __name__ == "__main__":
     main()
