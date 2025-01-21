@@ -88,35 +88,29 @@ def analyze_products(root):
 # Étape 4 : Validation des données
 def validate_products(products):
     errors = []
-    seen_ids = set()
     price_pattern = re.compile(r"^\d+(\.\d{1,2})?( [A-Z]{3})?$")  # Accepte les prix avec devise (ex: "44.99 EUR")
 
     for product in products:
-        # Vérification des champs obligatoires
-        if product['id'] == "MISSING":
-            errors.append(("Missing ID", product['id']))
-        if product['title'] == "MISSING":
-            errors.append(("Missing Title", product['id']))
-        if product['product_url'] == "MISSING":
-            errors.append(("Missing Product URL", product['id']))
-        if product['image_link'] == "MISSING":
-            errors.append(("Missing Image Link", product['id']))
-        if product['price'] == "MISSING" or not price_pattern.match(product['price']):
-            errors.append(("Invalid or Missing Price", product['id']))
-        
-        # Conditions spécifiques
-        if product['condition'] in ["used", "refurbished"] and product['condition'] == "MISSING":
-            errors.append(("Missing Condition", product['id']))
-        if product['brand'] == "MISSING":
-            errors.append(("Missing Brand", product['id']))
-
-        # Vêtements et accessoires
-        if product['color'] == "MISSING" or product['size'] == "MISSING" or product['gender'] == "MISSING":
-            errors.append(("Missing Clothing Attributes", product['id']))
+        if product.get('id', 'MISSING') == "MISSING":
+            errors.append(("Missing ID", product.get('id', 'MISSING')))
+        if product.get('title', 'MISSING') == "MISSING":
+            errors.append(("Missing Title", product.get('id', 'MISSING')))
+        if product.get('product_url', 'MISSING') == "MISSING":
+            errors.append(("Missing Product URL", product.get('id', 'MISSING')))
+        if product.get('image_link', 'MISSING') == "MISSING":
+            errors.append(("Missing Image Link", product.get('id', 'MISSING')))
+        if product.get('price', 'MISSING') == "MISSING" or not price_pattern.match(product.get('price', '')):
+            errors.append(("Invalid or Missing Price", product.get('id', 'MISSING')))
+        if product.get('condition', 'MISSING') == "MISSING":
+            errors.append(("Missing Condition", product.get('id', 'MISSING')))
+        if product.get('brand', 'MISSING') == "MISSING":
+            errors.append(("Missing Brand", product.get('id', 'MISSING')))
+        if product.get('color', 'MISSING') == "MISSING" or product.get('size', 'MISSING') == "MISSING" or product.get('gender', 'MISSING') == "MISSING":
+            errors.append(("Missing Clothing Attributes", product.get('id', 'MISSING')))
 
     return errors, products
 
-# Main Function
+# Fonction principale
 def main():
     add_custom_css()
     st.markdown("<h1 class='main-title'>Audit Flux Google Merchant</h1>", unsafe_allow_html=True)
@@ -138,11 +132,10 @@ def main():
                 products = analyze_products(root)
                 errors, validated_products = validate_products(products)
 
-                if errors:
-                    st.write(f"Nombre total de produits analysés : {len(products)}")
-                    st.write(f"Nombre total d'erreurs : {len(errors)}")
-                    for error_type, count in summarize_errors(errors).items():
-                        st.write(f"- {error_type}: {count}")
+                st.write(f"Nombre total de produits analysés : {len(products)}")
+                st.write(f"Nombre total d'erreurs : {len(errors)}")
+                for error_type, count in Counter([e[0] for e in errors]).items():
+                    st.write(f"- {error_type}: {count}")
 
 if __name__ == "__main__":
     main()
