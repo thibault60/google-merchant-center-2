@@ -87,7 +87,7 @@ def validate_products(products):
             'invalid_or_missing_price': "Erreur" if product.get('price', 'MISSING') == "MISSING" or not price_pattern.match(product.get('price', '')) else "OK",
             'null_price': "Erreur" if product.get('price', '').startswith("0") else "OK",
             'missing_title': "Erreur" if product.get('title', 'MISSING') == "MISSING" else "OK",
-            'description_missing_or_short': "Erreur" if len(product.get('description', '')) < 20 else "OK",
+            'description_missing_or_short': "Erreur" if len(product.get('description', '') or '') < 20 else "OK",
             'invalid_availability': "Erreur" if product.get('availability', 'MISSING') == "MISSING" else "OK",
             'missing_or_empty_color': "Erreur" if product.get('color', 'MISSING') == "MISSING" else "OK",
             'missing_or_empty_gender': "Erreur" if product.get('gender', 'MISSING') == "MISSING" else "OK",
