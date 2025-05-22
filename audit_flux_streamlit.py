@@ -7,10 +7,25 @@ from io import BytesIO
 import re
 from decimal import Decimal, InvalidOperation
 
+"""Audit d'un flux Google Merchant (ou équivalent interne en français)
+====================================================================
+Ce script Streamlit :
+1. Télécharge ou lit un fichier XML.
+2. Détecte automatiquement si c'est un vrai flux Google Merchant (<item>)
+   ou un flux interne français (<Sheet1>).
+3. Extrait les produits, normalise les prix et GTIN.
+4. Applique plusieurs règles de validation (prix, disponibilité, etc.).
+5. Génère un fichier Excel avec deux onglets :
+   • « Validation » : toutes les données + colonnes OK/Erreur.
+   • « Recap_Attributs » : pour chaque attribut, nombre/%% de valeurs manquantes.
+"""
+
 # ---------------------------------------------------------------------------
-# 1)   CSS Streamlit : look & feel
+# 1) Helper : CSS pour Streamlit
 # ---------------------------------------------------------------------------
+
 def add_custom_css():
+    """Applique un thème léger dans l'app Streamlit."""
     st.markdown(
         """
         <style>
@@ -22,241 +37,274 @@ def add_custom_css():
     )
 
 # ---------------------------------------------------------------------------
-# 2)   Téléchargement du flux (URL ou upload)
+# 2) Téléchargement ou lecture du fichier XML
 # ---------------------------------------------------------------------------
-def fetch_xml(url: str) -> bytes | None:
+
+def fetch_xml(url: str) -> bytes | None:  # pragma: no cover
+    """Retourne le contenu brut du XML à partir d'une URL."""
     try:
         response = requests.get(url, timeout=15)
         response.raise_for_status()
         return response.content
-    except requests.exceptions.RequestException as e:
-        st.error(f"Erreur lors du téléchargement du flux : {e}")
+    except requests.exceptions.RequestException as exc:
+        st.error(f"Erreur lors du téléchargement du flux : {exc}")
         return None
 
 # ---------------------------------------------------------------------------
-# 3)   Parsing XML → ElementTree root
+# 3) Parsing XML
 # ---------------------------------------------------------------------------
+
 def parse_xml(content: bytes) -> ET.Element | None:
+    """Transforme le contenu en ElementTree root."""
     try:
         return ET.fromstring(content)
-    except ET.ParseError as e:
-        st.error(f"Erreur lors du parsing XML : {e}")
+    except ET.ParseError as exc:
+        st.error(f"Erreur lors du parsing XML : {exc}")
         return None
 
 # ---------------------------------------------------------------------------
-# 4)   Helpers : normalisation prix / GTIN
+# 4) Normalisation prix & GTIN
 # ---------------------------------------------------------------------------
-_price_re = re.compile(r"^(\d+[.,]?\d*)(?:\s*([A-Z]{3}))?$")  # ex : 44.99 EUR, 44,99EUR, 44 EUR
+
+_PRICE_RE = re.compile(r"^(\d+[.,]?\d*)(?:\s*([A-Z]{3}))?$")
+
 
 def normalize_price(raw: str) -> str:
-    """
-    Nettoie un prix en entrée :
-    - remplace la virgule par un point pour garder la convention US
-    - isole la devise si présente
-    - retourne 'MISSING' si vide
-    """
-    if not raw:
+    """Convertit « 44,99EUR » → « 44.99 EUR ». Retourne MISSING si vide."""
+    if not raw or raw == "MISSING":
         return "MISSING"
-    
-    match = _price_re.match(raw.strip())
-    if not match:
-        return raw.strip()  # laisser l’utilisateur voir la valeur non conforme
-    
-    amount, currency = match.groups()
+
+    m = _PRICE_RE.match(raw.strip())
+    if not m:
+        return raw.strip()  # valeur non conforme, on la laisse telle quelle
+
+    amount, currency = m.groups()
     amount = amount.replace(",", ".")
     try:
-        # arrondi à 2 décimales maxi
         amount = f"{Decimal(amount):.2f}".rstrip("0").rstrip(".")
     except InvalidOperation:
         return raw.strip()
-    
+
     return f"{amount} {currency or 'EUR'}".strip()
 
+
 def normalize_gtin(raw: str) -> str:
-    """
-    Convertit la notation scientifique éventuelle '8.80609E+12' → '8806090000000'.
-    Préserve la valeur d'origine si la conversion échoue.
-    """
+    """Convertit 8.8061E+12 en 8806100000000 (GTIN‑13)."""
     if not raw or raw == "MISSING":
         return "MISSING"
     try:
-        as_int = int(Decimal(raw))
-        return f"{as_int:013d}"  # GTIN-13
+        value = int(Decimal(raw))
+        return f"{value:013d}"
     except (InvalidOperation, ValueError):
         return raw
 
 # ---------------------------------------------------------------------------
-# 5)   Analyse des produits : double stratégie (Merchant / Français)
+# 5) Analyse des produits : détection automatique Merchant vs Français
 # ---------------------------------------------------------------------------
-def analyze_products(root: ET.Element) -> list[dict]:
-    namespace = {"g": "http://base.google.com/ns/1.0"}
-    # --- Cas 1 : flux Google Merchant standard -----------------------------
-    merchant_items = root.findall(".//item", namespace)
-    if merchant_items:
-        return [_parse_google_item(it, namespace) for it in merchant_items]
 
-    # --- Cas 2 : flux « français » ------------------------------------------
+_NAMESPACE = {"g": "http://base.google.com/ns/1.0"}
+
+
+def analyze_products(root: ET.Element) -> list[dict]:
+    """Retourne une liste de dictionnaires produits."""
+    merchant_items = root.findall(".//item", _NAMESPACE)
+    if merchant_items:
+        return [_parse_google_item(it) for it in merchant_items]
+
     sheet_items = root.findall(".//Sheet1")
     return [_parse_french_item(it) for it in sheet_items]
 
-# ---------- Sous-fonctions de parsing --------------------------------------
-def _parse_google_item(item: ET.Element, ns) -> dict:
-    def g(tag):  # racourci
-        elem = item.find(f"g:{tag}", ns)
-        return elem.text.strip() if elem is not None and elem.text else "MISSING"
 
-    def g_or_plain(tag):
-        # g:title ou title
-        elem = item.find(f"g:{tag}", ns) or item.find(tag)
-        return elem.text.strip() if elem is not None and elem.text else "MISSING"
+# ---------------------------------------------------------------------------
+# 5a) Parsing Google Merchant standard
+# ---------------------------------------------------------------------------
 
-    def get_shipping_block():
-        shipping = item.find("g:shipping", ns)
-        return "".join(shipping.itertext()).strip() if shipping is not None else "MISSING"
+def _parse_google_item(item: ET.Element) -> dict:
+    g = lambda tag: (item.findtext(f"g:{tag}", namespaces=_NAMESPACE) or "").strip() or "MISSING"
 
-    product = {
-        "id"                : g("id"),
-        "title"             : g_or_plain("title"),
-        "description"       : g_or_plain("description"),
-        "link"              : g_or_plain("link"),
-        "image_link"        : g("image_link"),
-        "price"             : normalize_price(g("price")),
-        "availability"      : g("availability"),
-        "color"             : g("color"),
-        "gender"            : g("gender"),
-        "size"              : g("size"),
-        "age_group"         : g("age_group"),
-        "condition"         : g("condition"),
-        "brand"             : g("brand"),
-        "gtin"              : normalize_gtin(g("gtin")),
-        "mpn"               : g("mpn"),
-        "item_group_id"     : g("item_group_id"),
-        "shipping"          : get_shipping_block(),
-        "shipping_weight"   : g("shipping_weight"),
-        "pattern"           : g("pattern"),
-        "material"          : g("material"),
-        "additional_image_link"   : g("additional_image_link"),
-        "size_type"         : g("size_type"),
-        "size_system"       : g("size_system"),
-        "canonical_link"    : g("canonical_link"),
-        "expiration_date"   : g("expiration_date"),
-        "sale_price"        : normalize_price(g("sale_price")),
+    def g_or_plain(tag: str) -> str:
+        txt = item.findtext(f"g:{tag}", namespaces=_NAMESPACE) or item.findtext(tag)
+        return (txt or "").strip() or "MISSING"
+
+    shipping_elem = item.find("g:shipping", _NAMESPACE)
+    shipping_block = "".join(shipping_elem.itertext()).strip() if shipping_elem is not None else "MISSING"
+
+    return {
+        "id": g("id"),
+        "title": g_or_plain("title"),
+        "description": g_or_plain("description"),
+        "link": g_or_plain("link"),
+        "image_link": g("image_link"),
+        "price": normalize_price(g("price")),
+        "sale_price": normalize_price(g("sale_price")),
+        "availability": g("availability"),
+        "color": g("color"),
+        "gender": g("gender"),
+        "size": g("size"),
+        "age_group": g("age_group"),
+        "condition": g("condition"),
+        "brand": g("brand"),
+        "gtin": normalize_gtin(g("gtin")),
+        "mpn": g("mpn"),
+        "item_group_id": g("item_group_id"),
+        "shipping": shipping_block,
+        "shipping_weight": g("shipping_weight"),
+        "pattern": g("pattern"),
+        "material": g("material"),
+        "additional_image_link": g("additional_image_link"),
+        "size_type": g("size_type"),
+        "size_system": g("size_system"),
+        "canonical_link": g("canonical_link"),
+        "expiration_date": g("expiration_date"),
         "sale_price_effective_date": g("sale_price_effective_date"),
-        "product_highlight" : g("product_highlight"),
+        "product_highlight": g("product_highlight"),
         "ships_from_country": g("ships_from_country"),
-        "max_handling_time" : g("max_handling_time"),
-        "availability_date" : g("availability_date"),
+        "max_handling_time": g("max_handling_time"),
+        "availability_date": g("availability_date"),
     }
-    return product
+
+# ---------------------------------------------------------------------------
+# 5b) Parsing flux interne français
+# ---------------------------------------------------------------------------
 
 def _parse_french_item(item: ET.Element) -> dict:
-    txt = lambda tag: (item.findtext(tag) or "").strip() or "MISSING"
+    def txt(tag: str, *alternatives: str) -> str:
+        for t in (tag, *alternatives):
+            value = (item.findtext(t) or "").strip()
+            if value:
+                return value
+        return "MISSING"
 
-    product = {
-        "id"                : txt("identifiant"),
-        "title"             : txt("titre"),
-        "description"       : txt("description"),
-        "link"              : txt("lien"),
-        "image_link"        : txt("lienimage"),
-        "price"             : normalize_price(txt("prix")),
-        "availability"      : txt("disponibilite"),      # sans accent dans l’XML fourni
-        "color"             : txt("couleur"),
-        "gender"            : txt("genre"),
-        "size"              : txt("taille"),
-        "age_group"         : txt("tranche_age"),
-        "condition"         : txt("etat"),
-        "brand"             : txt("marque"),
-        "gtin"              : normalize_gtin(txt("gtin")),
-        "mpn"               : txt("mpn"),
-        "item_group_id"     : txt("id_groupe_article"),
-        "shipping"          : txt("expedition"),
-        "shipping_weight"   : txt("poids_expedition"),
-        "pattern"           : txt("motif"),
-        "material"          : txt("materiau"),
-        "additional_image_link"   : txt("lienimage_suppl"),
-        "size_type"         : txt("type_taille"),
-        "size_system"       : txt("systeme_taille"),
-        "canonical_link"    : txt("lien_canonique"),
-        "expiration_date"   : txt("date_expiration"),
-        "sale_price"        : normalize_price(txt("prix_promo")),
+    return {
+        "id": txt("identifiant"),
+        "title": txt("titre"),
+        "description": txt("description"),
+        "link": txt("lien"),
+        "image_link": txt("lienimage"),
+        "price": normalize_price(txt("prix")),
+        "sale_price": normalize_price(txt("prixsoldé", "prixsolde")),
+        "availability": txt("disponibilité", "disponibilite"),
+        "condition": txt("état", "etat"),
+        "brand": txt("marque"),
+        "gtin": normalize_gtin(txt("gtin")),
+        "mpn": txt("mpn"),
+        "color": txt("couleur"),
+        "size": txt("taille"),
+        "age_group": txt("tranche_age"),
+        "gender": txt("genre"),
+        "item_group_id": txt("id_groupe_article"),
+        "shipping": txt("expedition"),
+        "shipping_weight": txt("poids_expedition"),
+        "pattern": txt("motif"),
+        "material": txt("materiau", "matériau"),
+        "additional_image_link": txt("lienimage_suppl"),
+        "size_type": txt("type_taille"),
+        "size_system": txt("systeme_taille", "système_taille"),
+        "canonical_link": txt("lien_canonique"),
+        "expiration_date": txt("date_expiration"),
         "sale_price_effective_date": txt("periode_promo"),
-        "product_highlight" : txt("mise_en_avant"),
+        "product_highlight": txt("mise_en_avant"),
         "ships_from_country": txt("pays_expedition"),
-        "max_handling_time" : txt("delai_max_traitement"),
-        "availability_date" : txt("date_disponibilite"),
+        "max_handling_time": txt("delai_max_traitement"),
+        "availability_date": txt("date_disponibilite"),
     }
-    return product
 
 # ---------------------------------------------------------------------------
-# 6)   Validation des produits
+# 6) Validation des produits
 # ---------------------------------------------------------------------------
+
+_PRICE_VALID_RE = re.compile(r"^\d+(?:\.\d{1,2})?\s?[A-Z]{3}$")
+
+
 def validate_products(products: list[dict]) -> list[dict]:
-    price_regex = re.compile(r"^\d+(?:\.\d{1,2})?\s?[A-Z]{3}$")
+    """Ajoute les colonnes de validation à chaque produit."""
     seen_ids: set[str] = set()
-    validated = []
+    validated: list[dict] = []
 
-    for p in products:
-        pid = p.get("id", "MISSING")
-        price = p.get("price", "MISSING")
-        desc  = p.get("description", "")
+    for prod in products:
+        pid = prod.get("id", "MISSING")
+        price = prod.get("price", "MISSING")
+        desc = prod.get("description", "")
 
         errors = {
-            "duplicate_id"              : "Erreur" if pid in seen_ids else "OK",
-            "invalid_or_missing_price"   : "Erreur" if price=="MISSING" or not price_regex.match(price) else "OK",
-            "null_price"                : "Erreur" if price.startswith("0") else "OK",
-            "missing_title"             : "Erreur" if p.get("title")=="MISSING" else "OK",
-            "description_missing_or_short": "Erreur" if len(desc)<20 else "OK",
-            "invalid_availability"      : "Erreur" if p.get("availability")=="MISSING" else "OK",
-            "missing_or_empty_color"    : "Erreur" if p.get("color")=="MISSING" else "OK",
-            "missing_or_empty_gender"   : "Erreur" if p.get("gender")=="MISSING" else "OK",
-            "missing_or_empty_size"     : "Erreur" if p.get("size")=="MISSING" else "OK",
-            "missing_or_empty_age_group": "Erreur" if p.get("age_group")=="MISSING" else "OK",
-            "missing_or_empty_image_link": "Erreur" if p.get("image_link")=="MISSING" else "OK",
+            "duplicate_id": "Erreur" if pid in seen_ids else "OK",
+            "invalid_or_missing_price": (
+                "Erreur" if price == "MISSING" or not _PRICE_VALID_RE.match(price) else "OK"
+            ),
+            "null_price": "Erreur" if price.startswith("0") else "OK",
+            "missing_title": "Erreur" if prod.get("title") == "MISSING" else "OK",
+            "description_missing_or_short": "Erreur" if len(desc) < 20 else "OK",
+            "invalid_availability": "Erreur" if prod.get("availability") == "MISSING" else "OK",
+            "missing_or_empty_color": "Erreur" if prod.get("color") == "MISSING" else "OK",
+            "missing_or_empty_gender": "Erreur" if prod.get("gender") == "MISSING" else "OK",
+            "missing_or_empty_size": "Erreur" if prod.get("size") == "MISSING" else "OK",
+            "missing_or_empty_age_group": "Erreur" if prod.get("age_group") == "MISSING" else "OK",
+            "missing_or_empty_image_link": "Erreur" if prod.get("image_link") == "MISSING" else "OK",
         }
-        validated.append({**p, **errors})
+        validated.append({**prod, **errors})
         seen_ids.add(pid)
+
     return validated
 
 # ---------------------------------------------------------------------------
-# 7)   Export Excel
+# 7) Export Excel avec récapitulatif
 # ---------------------------------------------------------------------------
-_HEADERS = [
-    # attributs produit
-    "id","title","link","image_link","price","description","availability",
-    "condition","brand","gtin","mpn","color","size","age_group","gender",
-    "item_group_id","shipping","shipping_weight","pattern","material",
-    "additional_image_link","size_type","size_system","canonical_link",
-    "expiration_date","sale_price","sale_price_effective_date",
-    "product_highlight","ships_from_country","max_handling_time",
-    "availability_date",
-    # validations
-    "duplicate_id","invalid_or_missing_price","null_price","missing_title",
-    "description_missing_or_short","invalid_availability","missing_or_empty_color",
-    "missing_or_empty_gender","missing_or_empty_size","missing_or_empty_age_group",
+
+_PRODUCT_ATTRS = [
+    "id", "title", "link", "image_link", "price", "description", "availability",
+    "condition", "brand", "gtin", "mpn", "color", "size", "age_group", "gender",
+    "item_group_id", "shipping", "shipping_weight", "pattern", "material",
+    "additional_image_link", "size_type", "size_system", "canonical_link",
+    "expiration_date", "sale_price", "sale_price_effective_date", "product_highlight",
+    "ships_from_country", "max_handling_time", "availability_date",
+]
+
+_VALIDATION_ATTRS = [
+    "duplicate_id", "invalid_or_missing_price", "null_price", "missing_title",
+    "description_missing_or_short", "invalid_availability", "missing_or_empty_color",
+    "missing_or_empty_gender", "missing_or_empty_size", "missing_or_empty_age_group",
     "missing_or_empty_image_link",
 ]
+
+_HEADERS = _PRODUCT_ATTRS + _VALIDATION_ATTRS
+
 
 def generate_excel(data: list[dict]) -> BytesIO:
     wb = Workbook()
     ws = wb.active
     ws.title = "Validation"
 
+    # --- Feuille Validation -------------------------------------------------
     ws.append(_HEADERS)
     for cell in ws[1]:
         cell.font = Font(bold=True)
 
     for prod in data:
-        ws.append([prod.get(col,"") for col in _HEADERS])
+        ws.append([prod.get(col, "") for col in _HEADERS])
 
-    bio = BytesIO()
-    wb.save(bio)
-    bio.seek(0)
-    return bio
+    # --- Feuille Recap_Attributs -------------------------------------------
+    recap = wb.create_sheet("Recap_Attributs")
+    recap.append(["Attribut", "Présents", "Manquants", "% manquant"])
+    for cell in recap[1]:
+        cell.font = Font(bold=True)
+
+    total = len(data) or 1  # éviter division par zéro
+    for attr in _PRODUCT_ATTRS:
+        missing = sum(1 for p in data if p.get(attr) in ("", "MISSING"))
+        present = total - missing
+        pct_missing = missing / total * 100
+        recap.append([attr, present, missing, f"{pct_missing:.1f}"])
+
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
 
 # ---------------------------------------------------------------------------
-# 8)   Interface Streamlit
+# 8) Interface Streamlit
 # ---------------------------------------------------------------------------
-def main():
+
+def main():  # pragma: no cover
     add_custom_css()
     st.markdown("<h1 class='main-title'>Audit Flux Google Merchant</h1>", unsafe_allow_html=True)
 
@@ -264,10 +312,15 @@ def main():
     uploaded_file = st.file_uploader("… ou téléchargez un fichier XML :", type=["xml"])
 
     if st.button("Auditer le flux"):
-        content = fetch_xml(url) if url else uploaded_file.read() if uploaded_file else None
+        if url:
+            content = fetch_xml(url)
+        elif uploaded_file is not None:
+            content = uploaded_file.read()
+        else:
+            st.warning("Veuillez fournir une URL ou un fichier XML.")
+            st.stop()
 
         if not content:
-            st.warning("Aucun contenu à analyser.")
             st.stop()
 
         root = parse_xml(content)
@@ -275,16 +328,17 @@ def main():
             st.stop()
 
         products = analyze_products(root)
-        validated_products = validate_products(products)
-        excel_data = generate_excel(validated_products)
+        validated = validate_products(products)
+        xlsx = generate_excel(validated)
 
-        st.success(f"Audit terminé ! {len(products)} produit(s) analysé(s).")
+        st.success(f"Audit terminé ! {len(products)} produit(s) analysé(s).")
         st.download_button(
             label="Télécharger le rapport Excel",
-            data=excel_data,
+            data=xlsx,
             file_name="audit_flux_google_merchant.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
+
 
 if __name__ == "__main__":
     main()
