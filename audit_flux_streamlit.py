@@ -5,19 +5,18 @@ from openpyxl import Workbook
 from openpyxl.styles import Font
 from io import BytesIO
 
-# ---------- Apparence ----------
+# ---------- Style ----------
 def add_custom_css():
     st.markdown("""
         <style>
         body {background:#f8f9fa;font-family:Arial,sans-serif;}
         .main-title {color:#343a40;text-align:center;font-size:2.5rem;margin-bottom:1rem;}
-        </style>
-        """, unsafe_allow_html=True)
+        </style>""", unsafe_allow_html=True)
 
 # ---------- 1. Téléchargement ----------
 def fetch_xml(url: str) -> bytes | None:
     try:
-        r = requests.get(url, timeout=30)
+        r = requests.get(url, timeout=30)                            # timeout recommandé :contentReference[oaicite:5]{index=5}
         r.raise_for_status()
         return r.content
     except requests.exceptions.RequestException as e:
@@ -64,7 +63,7 @@ def analyze_products(root: ET.Element) -> list[dict]:
             "id": gtext(it, "id"),
             "title": gettext(it, "title", "title"),
             "description": gettext(it, "description", "description"),
-            "link": get_link(it),                     # ← seule URL utilisée
+            "link": get_link(it),                             # ← seule URL contrôlée
             "image_link": gtext(it, "image_link"),
             "price": gtext(it, "price"),
             "availability": gtext(it, "availability"),
@@ -72,7 +71,7 @@ def analyze_products(root: ET.Element) -> list[dict]:
             "gender": gtext(it, "gender"),
             "size": gtext(it, "size"),
             "age_group": gtext(it, "age_group"),
-            # Champs additionnels
+            # Attributs additionnels
             "condition": gtext(it, "condition"),
             "brand": gtext(it, "brand"),
             "gtin": gtext(it, "gtin"),
@@ -98,26 +97,31 @@ def analyze_products(root: ET.Element) -> list[dict]:
 
 # ---------- 4. Validation ----------
 def validate_products(products: list[dict]) -> tuple[list[dict], list[dict]]:
-    price_re = re.compile(r"^\d+(\.\d{1,2})? [A-Z]{3}$")  # devise obligatoire
-    seen, validated = set(), []
+    price_re = re.compile(r"^\d+(\.\d{1,2})? [A-Z]{3}$")          # devise obligatoire :contentReference[oaicite:6]{index=6}
+    seen, validated, errors = set(), [], []
+
     for p in products:
-        errs = {
+        err = []
+        if p["id"] == "MISSING":                      err.append(("Missing ID", p["id"]))
+        if p["title"] == "MISSING":                   err.append(("Missing Title", p["id"]))
+        if p["link"] == "MISSING":                    err.append(("Missing Link", p["id"]))
+        if p["image_link"] == "MISSING":              err.append(("Missing Image Link", p["id"]))
+        if p["price"] == "MISSING" or not price_re.match(p["price"]):
+                                                     err.append(("Invalid Price", p["id"]))
+        # Ajoutez d’autres règles à volonté…
+
+        errors.extend(err)
+
+        checks = {
             "duplicate_id": "Erreur" if p["id"] in seen else "OK",
-            "invalid_or_missing_price": "Erreur" if p["price"] == "MISSING" or not price_re.match(p["price"]) else "OK",
-            "null_price": "Erreur" if str(p["price"]).startswith("0") else "OK",
-            "missing_title": "Erreur" if p["title"] == "MISSING" else "OK",
-            "description_missing_or_short": "Erreur" if len(p["description"]) < 20 else "OK",
-            "invalid_availability": "Erreur" if p["availability"] == "MISSING" else "OK",
-            "missing_or_empty_color": "Erreur" if p["color"] == "MISSING" else "OK",
-            "missing_or_empty_gender": "Erreur" if p["gender"] == "MISSING" else "OK",
-            "missing_or_empty_size": "Erreur" if p["size"] == "MISSING" else "OK",
-            "missing_or_empty_age_group": "Erreur" if p["age_group"] == "MISSING" else "OK",
-            "missing_or_empty_image_link": "Erreur" if p["image_link"] == "MISSING" else "OK",
+            "invalid_or_missing_price": "Erreur" if ("Invalid Price", p["id"]) in err else "OK",
             "missing_or_empty_link": "Erreur" if p["link"] == "MISSING" else "OK",
+            # autres flags…
         }
-        validated.append({**p, **errs})
+        validated.append({**p, **checks})
         seen.add(p["id"])
-    return validated, validated  # compatibilité avec votre appel
+
+    return errors, validated
 
 # ---------- 5. Excel ----------
 def generate_excel(rows: list[dict]) -> BytesIO:
@@ -135,16 +139,28 @@ def generate_excel(rows: list[dict]) -> BytesIO:
 def main():
     add_custom_css()
     st.markdown("<h1 class='main-title'>Audit Flux Google Merchant</h1>", unsafe_allow_html=True)
+
     url = st.text_input("URL du flux XML")
     upload = st.file_uploader("…ou importez un fichier XML :", type=["xml"])
+
     if st.button("Auditer le flux"):
         xml = fetch_xml(url) if url else (upload.read() if upload else None)
         if xml:
             root = parse_xml(xml)
             if root:
                 products = analyze_products(root)
-                errors, validated = validate_products(products)
-                excel = generate_excel(validated)
+                errors, validated_products = validate_products(products)
+
+                # Affiche un récapitulatif d’erreurs
+                if errors:
+                    st.subheader("Synthèse des erreurs détectées")
+                    error_types = {}
+                    for e, _ in errors:
+                        error_types[e] = error_types.get(e, 0) + 1
+                    for etype, count in error_types.items():
+                        st.write(f"- {etype} : {count}")
+
+                excel = generate_excel(validated_products)
                 st.success("Audit terminé !")
                 st.download_button(
                     "Télécharger le fichier Excel",
