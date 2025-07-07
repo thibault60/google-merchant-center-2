@@ -99,8 +99,19 @@ def analyze_products(root: ET.Element) -> list[dict]:
 # ----------------------  4a) Merchant  ----------------------
 
 def _parse_google_item(item: ET.Element) -> dict:
-    g = lambda tag: (item.findtext(f"g:{tag}", namespaces=_NAMESPACE) or "").strip() or "MISSING"
-    g_or_plain = lambda tag: ((item.findtext(f"g:{tag}", _NAMESPACE) or item.findtext(tag) or "").strip() or "MISSING")
+    # ✅ Passage explicite du paramètre namespaces
+    g = lambda tag: (
+        (item.findtext(f"g:{tag}", namespaces=_NAMESPACE) or "").strip()
+        or "MISSING"
+    )
+    g_or_plain = lambda tag: (
+        (
+            item.findtext(f"g:{tag}", namespaces=_NAMESPACE)
+            or item.findtext(tag)
+            or ""
+        ).strip()
+        or "MISSING"
+    )
 
     shipping_elem = item.find("g:shipping", _NAMESPACE)
     shipping_block = "".join(shipping_elem.itertext()).strip() if shipping_elem is not None else "MISSING"
@@ -213,7 +224,6 @@ def _parse_french_item(item: ET.Element) -> dict:
     # 3) balise FR concaténée certification…
     concat_val = (item.findtext("certificationcertificationauthoritycertificationcodecertificationname") or "").strip()
     if concat_val:
-        # ex: "European Commission:1403953:EPREL"
         parts = concat_val.split(":")
         if len(parts) == 3:
             data["certification_authority"], data["certification_code"], data["certification_name"] = parts
