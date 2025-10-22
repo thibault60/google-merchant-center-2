@@ -6,6 +6,7 @@ from openpyxl.styles import Font
 from io import BytesIO
 import re
 from decimal import Decimal, InvalidOperation
+from collections import defaultdict
 
 """
 Audit d'un flux Google Merchant – version « mapping FR ➜ EN »
@@ -15,7 +16,7 @@ Audit d'un flux Google Merchant – version « mapping FR ➜ EN »
 • Extrait les produits, convertit les attributs FR ➜ EN.
 • Normalise prix, GTIN, dimensions.
 • Valide attributs clés + certification/dimensions.
-• Exporte un rapport Excel.
+• Exporte un rapport Excel, avec récap par statut (Mandatory/Recommended…).
 """
 
 # ---------------------------------------------------------------------------
@@ -99,7 +100,6 @@ def analyze_products(root: ET.Element) -> list[dict]:
 # ----------------------  4a) Merchant  ----------------------
 
 def _parse_google_item(item: ET.Element) -> dict:
-    # ✅ Passage explicite du paramètre namespaces
     g = lambda tag: (
         (item.findtext(f"g:{tag}", namespaces=_NAMESPACE) or "").strip()
         or "MISSING"
@@ -113,8 +113,16 @@ def _parse_google_item(item: ET.Element) -> dict:
         or "MISSING"
     )
 
+    # Shipping (bloc)
     shipping_elem = item.find("g:shipping", _NAMESPACE)
     shipping_block = "".join(shipping_elem.itertext()).strip() if shipping_elem is not None else "MISSING"
+
+    # product_detail peut être multiple – on concatène proprement
+    product_detail_elems = item.findall("g:product_detail", _NAMESPACE)
+    if product_detail_elems:
+        product_detail_txt = " | ".join((" ".join(pd.itertext()).strip() for pd in product_detail_elems)).strip() or "MISSING"
+    else:
+        product_detail_txt = g("product_detail")
 
     return {
         "id": g("id"),
@@ -158,14 +166,15 @@ def _parse_google_item(item: ET.Element) -> dict:
         "sale_price_effective_date": g("sale_price_effective_date"),
         "product_highlight": g("product_highlight"),
         "ships_from_country": g("ships_from_country"),
+        "minimum_handling_time": g("minimum_handling_time"),
         "max_handling_time": g("max_handling_time"),
         "availability_date": g("availability_date"),
+        "product_detail": product_detail_txt,
         "google_product_category": g_or_plain("google_product_category"),
     }
 
 # ----------------------  4b) Flux interne FR  ----------------------
 
-# mapping : balise française → clé Merchant
 FR_TO_EN_MAPPING = {
     "titre": "title",
     "identifiant": "id",
@@ -184,6 +193,7 @@ FR_TO_EN_MAPPING = {
     "genre": "gender",
     "marque": "brand",
     "catégoriedeproduitsgoogle": "google_product_category",
+    "categoriedeproduitsgoogle": "google_product_category",
     # dimensions / poids
     "longueur_produit": "product_length",
     "largeur_produit": "product_width",
@@ -193,16 +203,20 @@ FR_TO_EN_MAPPING = {
     "largeur_colis": "shipping_width",
     "hauteur_colis": "shipping_height",
     "poids_expedition": "shipping_weight",
-    # certification sous forme de 3 balises FR (rare)
+    # certification
     "autorité_certification": "certification_authority",
+    "autorite_certification": "certification_authority",
     "nom_certification": "certification_name",
     "code_certification": "certification_code",
+    # délai de traitement
+    "delai_traitement_minimum": "minimum_handling_time",
+    "delai_traitement_maximum": "max_handling_time",
 }
 
 def _parse_french_item(item: ET.Element) -> dict:
     data: dict = {}
 
-    # 1) mapping direct
+    # 1) mapping direct FR -> EN
     for fr_tag, en_key in FR_TO_EN_MAPPING.items():
         raw = (item.findtext(fr_tag) or "").strip()
         if raw:
@@ -214,21 +228,23 @@ def _parse_french_item(item: ET.Element) -> dict:
         "pattern", "material", "additional_image_link", "size_type",
         "size_system", "canonical_link", "expiration_date",
         "sale_price_effective_date", "product_highlight",
-        "ships_from_country", "max_handling_time", "availability_date",
+        "ships_from_country", "minimum_handling_time", "max_handling_time",
+        "availability_date", "product_detail",
+        "google_product_category",
     ]
     for tag in direct_tags:
         txt = (item.findtext(tag) or "").strip()
         if txt:
             data[tag] = txt
 
-    # 3) balise FR concaténée certification…
+    # 3) certification concaténée (fallback rare)
     concat_val = (item.findtext("certificationcertificationauthoritycertificationcodecertificationname") or "").strip()
     if concat_val:
         parts = concat_val.split(":")
         if len(parts) == 3:
             data["certification_authority"], data["certification_code"], data["certification_name"] = parts
         else:
-            data["certification_authority"] = concat_val  # fallback
+            data["certification_authority"] = concat_val
 
     # 4) normalisations
     data["price"] = normalize_price(data.get("price", "MISSING"))
@@ -268,26 +284,29 @@ def validate_products(products: list[dict]) -> list[dict]:
         )
 
         errors = {
-            "duplicate_id":             "Erreur" if pid in seen_ids else "OK",
-            "invalid_or_missing_price": "Erreur" if price == "MISSING" or not _PRICE_VALID_RE.match(price) else "OK",
-            "null_price":               "Erreur" if price.startswith("0") else "OK",
-            "missing_title":            "Erreur" if prod["title"] == "MISSING" else "OK",
+            "duplicate_id":                 "Erreur" if pid in seen_ids else "OK",
+            "invalid_or_missing_price":     "Erreur" if price == "MISSING" or not _PRICE_VALID_RE.match(price) else "OK",
+            "null_price":                   "Erreur" if price.startswith("0") else "OK",
+            "missing_title":                "Erreur" if prod["title"] == "MISSING" else "OK",
             "description_missing_or_short": "Erreur" if len(desc) < 20 else "OK",
-            "invalid_availability":     "Erreur" if prod["availability"] == "MISSING" else "OK",
-            "missing_or_empty_color":   "Erreur" if missing("color") else "OK",
-            "missing_or_empty_gender":  "Erreur" if missing("gender") else "OK",
-            "missing_or_empty_size":    "Erreur" if missing("size") else "OK",
-            "missing_or_empty_age_group": "Erreur" if missing("age_group") else "OK",
-            "missing_or_empty_image_link": "Erreur" if missing("image_link") else "OK",
+            "invalid_availability":         "Erreur" if prod["availability"] == "MISSING" else "OK",
+            "missing_or_empty_color":       "Erreur" if missing("color") else "OK",
+            "missing_or_empty_gender":      "Erreur" if missing("gender") else "OK",
+            "missing_or_empty_size":        "Erreur" if missing("size") else "OK",
+            "missing_or_empty_age_group":   "Erreur" if missing("age_group") else "OK",
+            "missing_or_empty_image_link":  "Erreur" if missing("image_link") else "OK",
             # certification / dimensions
-            "missing_certification": "Erreur" if any(missing(a) for a in (
-                "certification_authority", "certification_name", "certification_code"
-            )) else "OK",
-            "missing_dimensions_weight": "Erreur" if any(missing(a) for a in (
-                "product_length", "product_width", "product_height", "product_weight",
-                "shipping_length", "shipping_width", "shipping_height"
-            )) else "OK",
-            "invalid_dimension_format": "Erreur" if dims_invalid else "OK",
+            "missing_certification":        "Erreur" if any(missing(a) for a in (
+                                                "certification_authority", "certification_name", "certification_code"
+                                              )) else "OK",
+            "missing_dimensions_weight":    "Erreur" if any(missing(a) for a in (
+                                                "product_length", "product_width", "product_height", "product_weight",
+                                                "shipping_length", "shipping_width", "shipping_height"
+                                              )) else "OK",
+            "invalid_dimension_format":     "Erreur" if dims_invalid else "OK",
+            # ✅ Nouveaux contrôles demandés
+            "missing_google_product_category": "Erreur" if missing("google_product_category") else "OK",
+            "missing_minimum_handling_time":   "Erreur" if missing("minimum_handling_time") else "OK",
         }
 
         validated.append({**prod, **errors})
@@ -296,9 +315,10 @@ def validate_products(products: list[dict]) -> list[dict]:
     return validated
 
 # ---------------------------------------------------------------------------
-# 6)  Export Excel
+# 6)  Export Excel – Statuts & Récap
 # ---------------------------------------------------------------------------
 
+# Liste des attributs exportés (ordre colonnes)
 _PRODUCT_ATTRS = [
     "id", "title", "link", "image_link", "price", "sale_price",
     "description", "availability", "condition", "brand",
@@ -312,40 +332,120 @@ _PRODUCT_ATTRS = [
     "shipping", "shipping_weight", "pattern", "material",
     "additional_image_link", "size_type", "size_system", "canonical_link",
     "expiration_date", "sale_price_effective_date", "product_highlight",
-    "ships_from_country", "max_handling_time", "availability_date",
+    "ships_from_country", "minimum_handling_time", "max_handling_time",
+    "availability_date", "product_detail",
 ]
 
+# Colonnes de validation
 _VALIDATION_ATTRS = [
     "duplicate_id", "invalid_or_missing_price", "null_price", "missing_title",
     "description_missing_or_short", "invalid_availability", "missing_or_empty_color",
     "missing_or_empty_gender", "missing_or_empty_size", "missing_or_empty_age_group",
     "missing_or_empty_image_link", "missing_certification",
     "missing_dimensions_weight", "invalid_dimension_format",
+    # ✅ nouveaux checks
+    "missing_google_product_category", "missing_minimum_handling_time",
 ]
 
 _HEADERS = _PRODUCT_ATTRS + _VALIDATION_ATTRS
+
+# Table des statuts (ta liste)
+FIELD_STATUS = {
+    "id": "Mandatory",
+    "title": "Mandatory",
+    "link": "Mandatory",
+    "image_link": "Mandatory",
+    "price": "Mandatory",
+    "description": "Mandatory",
+    "availability": "Mandatory",
+    "condition": "Mandatory IF SECOND-HAND or RECONDITIONED",
+    "brand": "Mandatory",
+    "gtin": "Mandatory if GTIN existing",
+    "mpn": "Mandatory if GTIN already exists",
+    "color": "Mandatory if CLOTHING AND ACCESSORIES",
+    "size": "Mandatory if CLOTHING AND ACCESSORIES",
+    "age_group": "Mandatory if CLOTHING AND ACCESSORIES",
+    "gender": "Mandatory if CLOTHING AND ACCESSORIES",
+    "item_group_id": "Mandatory FOR VARIANTS",
+    "shipping": "Mandatory if not configured in GMC",
+    "shipping_weight": "Recommended",
+    "pattern": "Recommended if CLOTHING AND ACCESSORIES",
+    "material": "Recommended if CLOTHING AND ACCESSORIES",
+    "additional_image_link": "Recommended",
+    "size_type": "Recommended if CLOTHING AND ACCESSORIES",
+    "size_system": "Recommended if CLOTHING AND ACCESSORIES",
+    "canonical_link": "Recommended",
+    "expiration_date": "Recommended to stop displaying a product",
+    "sale_price": "Recommended for promotions",
+    "sale_price_effective_date": "Recommended for promotions",
+    "product_highlight": "Recommended",
+    "ships_from_country": "Recommended",
+    "minimum_handling_time": "Recommended",
+    "max_handling_time": "Recommended",
+    "availability_date": "Mandatory if product is pre-ordered",
+    "certification_authority": "Recommended for ELECTRONICS & HOUSEHOLD EQUIPEMENT",
+    "certification_name": "Recommended for ELECTRONICS & HOUSEHOLD EQUIPEMENT",
+    "certification_code": "Recommended for ELECTRONICS & HOUSEHOLD EQUIPEMENT",
+    "product_detail": "Recommended",
+    "product_length": "Recommended for ELECTRONICS & HOUSEHOLD EQUIPEMENT",
+    "product_width": "Recommended for ELECTRONICS & HOUSEHOLD EQUIPEMENT",
+    "product_height": "Recommended for ELECTRONICS & HOUSEHOLD EQUIPEMENT",
+    "product_weight": "Recommended for ELECTRONICS & HOUSEHOLD EQUIPEMENT",
+    "shipping_length": "Recommended for ELECTRONICS & HOUSEHOLD EQUIPEMENT",
+    "shipping_width": "Recommended for ELECTRONICS & HOUSEHOLD EQUIPEMENT",
+    "shipping_height": "Recommended for ELECTRONICS & HOUSEHOLD EQUIPEMENT",
+    "google_product_category": "Mandatory",
+}
 
 def generate_excel(data: list[dict]) -> BytesIO:
     wb = Workbook()
     ws = wb.active
     ws.title = "Validation"
 
+    # Feuille 1 : données + flags
     ws.append(_HEADERS)
     for c in ws[1]:
         c.font = Font(bold=True)
-
     for prod in data:
         ws.append([prod.get(col, "") for col in _HEADERS])
 
+    # Feuille 2 : récap par attribut
     recap = wb.create_sheet("Recap_Attributs")
-    recap.append(["Attribut", "Présents", "Manquants", "% manquant"])
+    recap.append(["Attribut", "Statut", "Présents", "Manquants", "% manquant"])
     for c in recap[1]:
         c.font = Font(bold=True)
 
     total = len(data) or 1
+    # pour synthèse par statut
+    by_status_counts = defaultdict(list)  # status -> [missing_rate_of_attr1, attr2, ...]
+
     for attr in _PRODUCT_ATTRS:
         missing = sum(1 for p in data if p.get(attr) in ("", "MISSING"))
-        recap.append([attr, total - missing, missing, f"{missing/total*100:.1f}"])
+        status = FIELD_STATUS.get(attr, "")
+        missing_pct = (missing / total) * 100
+        recap.append([attr, status, total - missing, missing, f"{missing_pct:.1f}"])
+        if status:
+            by_status_counts[status].append(100 - missing_pct)  # on stocke la complétion pour la moyenne
+
+    # Feuille 3 : synthèse par statut
+    synth = wb.create_sheet("Synthese_par_statut")
+    synth.append(["Statut", "Nb attributs", "Taux de complétion moyen (%)", "Attributs"])
+    for c in synth[1]:
+        c.font = Font(bold=True)
+
+    for status, completion_list in by_status_counts.items():
+        attrs = [a for a, s in FIELD_STATUS.items() if s == status and a in _PRODUCT_ATTRS]
+        avg_completion = sum(completion_list) / len(completion_list) if completion_list else 0.0
+        synth.append([status, len(attrs), f"{avg_completion:.1f}", ", ".join(attrs)])
+
+    # Feuille 4 : règles (tableau brut des statuts fournis)
+    rules = wb.create_sheet("Regles_Attributs")
+    rules.append(["Field Name", "Status"])
+    for c in rules[1]:
+        c.font = Font(bold=True)
+    # on réinscrit la table pour transparence
+    for field, status in FIELD_STATUS.items():
+        rules.append([field, status])
 
     buf = BytesIO()
     wb.save(buf)
