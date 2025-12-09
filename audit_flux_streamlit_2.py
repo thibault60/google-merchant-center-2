@@ -109,6 +109,7 @@ _HEADERS = _PRODUCT_ATTRS + _VALIDATION_ATTRS
 
 # ---------------------------------------------------------------------------
 # 5)  Extraction produits depuis un TXT pipe '|'
+#     (ignore les lignes d'en-tête + BOM)
 # ---------------------------------------------------------------------------
 
 def parse_txt(content: bytes) -> list[dict]:
@@ -119,13 +120,29 @@ def parse_txt(content: bytes) -> list[dict]:
     for ln in lines:
         fields = ln.split("|")
 
+        # --- Détection et saut des en-têtes (case-insensitive) + gestion BOM ---
+        def low(i: int) -> str:
+            if i >= len(fields):
+                return ""
+            return fields[i].lstrip("\ufeff").strip().lower()
+
+        is_header = (
+            (low(0) in ("id", "g:id")) and
+            (low(1) in ("title", "g:title", "name")) and
+            (low(2) in ("link", "g:link")) and
+            (low(3) in ("image_link", "g:image_link", "price"))
+        )
+        if is_header:
+            continue
+        # ----------------------------------------------------------------------
+
         # Initialise toutes les colonnes exportées à MISSING
         prod = {key: "MISSING" for key in _PRODUCT_ATTRS}
 
-        # Mapping basé sur l'exemple fourni
         def get(i: int) -> str:
             return (fields[i].strip() if i < len(fields) else "")
 
+        # Mapping basé sur l'exemple :
         # 0:id | 1:title | 2:link | 3:price | 4:description | 5:condition
         # 6:gtin | 7:color | 8:mpn | 9:image_link
         # 10:breadcrumb (ignoré) | 11:availability | 12:shipping | 13:shipping_weight | 14:gpc
@@ -292,7 +309,7 @@ FIELD_STATUS = {
     "max_handling_time": "Recommended",
     "availability_date": "Mandatory if product is pre-ordered",
 
-    # Mentions « Electronics & Household Equipment » retirées
+    # Mentions supprimées (pas d'électronique ici)
     "certification_authority": "Optional",
     "certification_name": "Optional",
     "certification_code": "Optional",
