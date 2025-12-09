@@ -13,7 +13,7 @@ Audit d'un flux Google Merchant – version TXT pipe '|' ➜ EN
 • Télécharge ou lit un TXT (lignes pipe-séparées).
 • Extrait les produits et alimente les attributs EN attendus.
 • Normalise prix, GTIN, dimensions.
-• Valide attributs clés + certification/dimensions.
+• Valide attributs clés avec logique adaptée (textiles vs apparel/electronics).
 • Exporte un rapport Excel, avec récap par statut (Mandatory/Recommended…).
 """
 
@@ -76,7 +76,39 @@ def normalize_gtin(raw: str) -> str:
         return raw
 
 # ---------------------------------------------------------------------------
-# 4)  Extraction produits depuis un TXT pipe '|'
+# 4)  Colonnes exportées & Validation (ordre des colonnes Excel)
+# ---------------------------------------------------------------------------
+
+_PRODUCT_ATTRS = [
+    "id", "title", "link", "image_link", "price", "sale_price",
+    "description", "availability", "condition", "brand",
+    "gtin", "mpn", "color", "size", "age_group", "gender",
+    "item_group_id", "google_product_category",
+    # certification & dimensions
+    "certification_authority", "certification_name", "certification_code",
+    "product_length", "product_width", "product_height", "product_weight",
+    "shipping_length", "shipping_width", "shipping_height",
+    # autres
+    "shipping", "shipping_weight", "pattern", "material",
+    "additional_image_link", "size_type", "size_system", "canonical_link",
+    "expiration_date", "sale_price_effective_date", "product_highlight",
+    "ships_from_country", "minimum_handling_time", "max_handling_time",
+    "availability_date", "product_detail",
+]
+
+_VALIDATION_ATTRS = [
+    "duplicate_id", "invalid_or_missing_price", "null_price", "missing_title",
+    "description_missing_or_short", "invalid_availability", "missing_or_empty_color",
+    "missing_or_empty_gender", "missing_or_empty_size", "missing_or_empty_age_group",
+    "missing_or_empty_image_link", "missing_certification",
+    "missing_dimensions_weight", "invalid_dimension_format",
+    "missing_google_product_category", "missing_minimum_handling_time",
+]
+
+_HEADERS = _PRODUCT_ATTRS + _VALIDATION_ATTRS
+
+# ---------------------------------------------------------------------------
+# 5)  Extraction produits depuis un TXT pipe '|'
 # ---------------------------------------------------------------------------
 
 def parse_txt(content: bytes) -> list[dict]:
@@ -90,15 +122,14 @@ def parse_txt(content: bytes) -> list[dict]:
         # Initialise toutes les colonnes exportées à MISSING
         prod = {key: "MISSING" for key in _PRODUCT_ATTRS}
 
-        # Mapping minimal basé sur l'exemple fourni
+        # Mapping basé sur l'exemple fourni
         def get(i: int) -> str:
             return (fields[i].strip() if i < len(fields) else "")
 
-        # Positions d'après l'exemple:
         # 0:id | 1:title | 2:link | 3:price | 4:description | 5:condition
         # 6:gtin | 7:color | 8:mpn | 9:image_link
-        # 11:availability | 12:shipping | 13:shipping_weight | 14:google_product_category
-        # 16:item_group_id | 17:gender | 18:age_group | 19:pattern | 20:size
+        # 10:breadcrumb (ignoré) | 11:availability | 12:shipping | 13:shipping_weight | 14:gpc
+        # 15:breadcrumb2 (ignoré) | 16:item_group_id | 17:gender | 18:age_group | 19:pattern | 20:size
         prod["id"]          = get(0) or "MISSING"
         prod["title"]       = get(1) or "MISSING"
         prod["link"]        = get(2) or "MISSING"
@@ -119,13 +150,12 @@ def parse_txt(content: bytes) -> list[dict]:
         prod["pattern"]     = get(19) or "MISSING"
         prod["size"]        = get(20) or "MISSING"
 
-        # Brand : si un champ dédié n'existe pas dans la ligne d'exemple, on tente un fallback léger
-        # (ex.: valeur non vide après size) sinon laisse MISSING pour que la validation le signale.
+        # Brand : fallback si une colonne suivante contient une valeur pertinente
         candidate_brand = get(21)
         if candidate_brand and candidate_brand.lower() not in ("0", "na", "null"):
             prod["brand"] = candidate_brand
 
-        # additional_image_link : on cherche un champ contenant des URLs séparées par des virgules
+        # additional_image_link : cherche un champ avec URLs séparées par des virgules
         if prod["additional_image_link"] == "MISSING":
             for f in fields[22:]:
                 s = f.strip()
@@ -133,7 +163,7 @@ def parse_txt(content: bytes) -> list[dict]:
                     prod["additional_image_link"] = s
                     break
 
-        # ships_from_country : on prend le dernier token non vide de 2–3 lettres majuscules
+        # ships_from_country : dernier token 2–3 lettres majuscules (ex. FR)
         for f in reversed(fields):
             s = f.strip()
             if len(s) in (2, 3) and s.isupper():
@@ -149,7 +179,7 @@ def parse_txt(content: bytes) -> list[dict]:
     return products
 
 # ---------------------------------------------------------------------------
-# 5)  Validation
+# 6)  Validation (textiles par défaut ; règles strictes si apparel/électronique)
 # ---------------------------------------------------------------------------
 
 _PRICE_VALID_RE = re.compile(r"^\d+(?:\.\d{1,2})?\s?[A-Z]{3}$")
@@ -162,6 +192,15 @@ def validate_products(products: list[dict]) -> list[dict]:
         pid = prod["id"]
         price = prod["price"]
         desc  = prod["description"]
+
+        cat = (prod.get("google_product_category", "") or "").lower()
+        # Catégories où certains champs deviennent vraiment obligatoires
+        is_apparel = any(k in cat for k in [
+            "apparel", "clothing", "shoes", "accessories", "wear"
+        ])
+        is_electronics = any(k in cat for k in [
+            "electronic", "appliance", "camera", "computer", "phone", "tv", "audio"
+        ])
 
         def missing(attr: str) -> bool:
             return prod.get(attr) in ("", "MISSING")
@@ -181,21 +220,26 @@ def validate_products(products: list[dict]) -> list[dict]:
             "missing_title":                "Erreur" if prod["title"] == "MISSING" else "OK",
             "description_missing_or_short": "Erreur" if len(desc) < 20 else "OK",
             "invalid_availability":         "Erreur" if prod["availability"] == "MISSING" else "OK",
-            "missing_or_empty_color":       "Erreur" if missing("color") else "OK",
-            "missing_or_empty_gender":      "Erreur" if missing("gender") else "OK",
-            "missing_or_empty_size":        "Erreur" if missing("size") else "OK",
-            "missing_or_empty_age_group":   "Erreur" if missing("age_group") else "OK",
+
+            # Pour le linge de maison, non obligatoires (deviennent obligatoires en apparel)
+            "missing_or_empty_color":       "Erreur" if (is_apparel and missing("color")) else "OK",
+            "missing_or_empty_gender":      "Erreur" if (is_apparel and missing("gender")) else "OK",
+            "missing_or_empty_size":        "Erreur" if (is_apparel and missing("size")) else "OK",
+            "missing_or_empty_age_group":   "Erreur" if (is_apparel and missing("age_group")) else "OK",
+
             "missing_or_empty_image_link":  "Erreur" if missing("image_link") else "OK",
-            # certification / dimensions
-            "missing_certification":        "Erreur" if any(missing(a) for a in (
+
+            # Certification & dimensions : exigées uniquement pour l'électronique
+            "missing_certification":        "Erreur" if (is_electronics and any(missing(a) for a in (
                                                 "certification_authority", "certification_name", "certification_code"
-                                              )) else "OK",
-            "missing_dimensions_weight":    "Erreur" if any(missing(a) for a in (
+                                              ))) else "OK",
+            "missing_dimensions_weight":    "Erreur" if (is_electronics and any(missing(a) for a in (
                                                 "product_length", "product_width", "product_height", "product_weight",
                                                 "shipping_length", "shipping_width", "shipping_height"
-                                              )) else "OK",
-            "invalid_dimension_format":     "Erreur" if dims_invalid else "OK",
-            # ✅ Nouveaux contrôles demandés
+                                              ))) else "OK",
+            "invalid_dimension_format":     "Erreur" if (is_electronics and dims_invalid) else "OK",
+
+            # Contrôles génériques
             "missing_google_product_category": "Erreur" if missing("google_product_category") else "OK",
             "missing_minimum_handling_time":   "Erreur" if missing("minimum_handling_time") else "OK",
         }
@@ -206,41 +250,9 @@ def validate_products(products: list[dict]) -> list[dict]:
     return validated
 
 # ---------------------------------------------------------------------------
-# 6)  Export Excel – Statuts & Récap
+# 7)  Table des statuts (adaptée Home Textiles)
 # ---------------------------------------------------------------------------
 
-# Liste des attributs exportés (ordre colonnes)
-_PRODUCT_ATTRS = [
-    "id", "title", "link", "image_link", "price", "sale_price",
-    "description", "availability", "condition", "brand",
-    "gtin", "mpn", "color", "size", "age_group", "gender",
-    "item_group_id", "google_product_category",
-    # certification & dimensions
-    "certification_authority", "certification_name", "certification_code",
-    "product_length", "product_width", "product_height", "product_weight",
-    "shipping_length", "shipping_width", "shipping_height",
-    # autres
-    "shipping", "shipping_weight", "pattern", "material",
-    "additional_image_link", "size_type", "size_system", "canonical_link",
-    "expiration_date", "sale_price_effective_date", "product_highlight",
-    "ships_from_country", "minimum_handling_time", "max_handling_time",
-    "availability_date", "product_detail",
-]
-
-# Colonnes de validation
-_VALIDATION_ATTRS = [
-    "duplicate_id", "invalid_or_missing_price", "null_price", "missing_title",
-    "description_missing_or_short", "invalid_availability", "missing_or_empty_color",
-    "missing_or_empty_gender", "missing_or_empty_size", "missing_or_empty_age_group",
-    "missing_or_empty_image_link", "missing_certification",
-    "missing_dimensions_weight", "invalid_dimension_format",
-    # ✅ nouveaux checks
-    "missing_google_product_category", "missing_minimum_handling_time",
-]
-
-_HEADERS = _PRODUCT_ATTRS + _VALIDATION_ATTRS
-
-# Table des statuts (inchangée)
 FIELD_STATUS = {
     "id": "Mandatory",
     "title": "Mandatory",
@@ -253,18 +265,23 @@ FIELD_STATUS = {
     "brand": "Mandatory",
     "gtin": "Mandatory if GTIN existing",
     "mpn": "Mandatory if GTIN already exists",
-    "color": "Mandatory if CLOTHING AND ACCESSORIES",
-    "size": "Mandatory if CLOTHING AND ACCESSORIES",
-    "age_group": "Mandatory if CLOTHING AND ACCESSORIES",
-    "gender": "Mandatory if CLOTHING AND ACCESSORIES",
+
+    # Textiles / linge de maison : utiles mais non obligatoires
+    "color": "Recommended for HOME TEXTILES",
+    "size": "Recommended for HOME TEXTILES",
+    "age_group": "Optional",
+    "gender": "Optional",
+
     "item_group_id": "Mandatory FOR VARIANTS",
     "shipping": "Mandatory if not configured in GMC",
     "shipping_weight": "Recommended",
-    "pattern": "Recommended if CLOTHING AND ACCESSORIES",
-    "material": "Recommended if CLOTHING AND ACCESSORIES",
+
+    "pattern": "Recommended for HOME TEXTILES",
+    "material": "Recommended for HOME TEXTILES",
+
     "additional_image_link": "Recommended",
-    "size_type": "Recommended if CLOTHING AND ACCESSORIES",
-    "size_system": "Recommended if CLOTHING AND ACCESSORIES",
+    "size_type": "Recommended for HOME TEXTILES",
+    "size_system": "Recommended for HOME TEXTILES",
     "canonical_link": "Recommended",
     "expiration_date": "Recommended to stop displaying a product",
     "sale_price": "Recommended for promotions",
@@ -274,19 +291,28 @@ FIELD_STATUS = {
     "minimum_handling_time": "Recommended",
     "max_handling_time": "Recommended",
     "availability_date": "Mandatory if product is pre-ordered",
-    "certification_authority": "Recommended for ELECTRONICS & HOUSEHOLD EQUIPEMENT",
-    "certification_name": "Recommended for ELECTRONICS & HOUSEHOLD EQUIPEMENT",
-    "certification_code": "Recommended for ELECTRONICS & HOUSEHOLD EQUIPEMENT",
+
+    # Mentions « Electronics & Household Equipment » retirées
+    "certification_authority": "Optional",
+    "certification_name": "Optional",
+    "certification_code": "Optional",
     "product_detail": "Recommended",
-    "product_length": "Recommended for ELECTRONICS & HOUSEHOLD EQUIPEMENT",
-    "product_width": "Recommended for ELECTRONICS & HOUSEHOLD EQUIPEMENT",
-    "product_height": "Recommended for ELECTRONICS & HOUSEHOLD EQUIPEMENT",
-    "product_weight": "Recommended for ELECTRONICS & HOUSEHOLD EQUIPEMENT",
-    "shipping_length": "Recommended for ELECTRONICS & HOUSEHOLD EQUIPEMENT",
-    "shipping_width": "Recommended for ELECTRONICS & HOUSEHOLD EQUIPEMENT",
-    "shipping_height": "Recommended for ELECTRONICS & HOUSEHOLD EQUIPEMENT",
+
+    # Dimensions/poids utiles pour la logistique
+    "product_length": "Recommended",
+    "product_width": "Recommended",
+    "product_height": "Recommended",
+    "product_weight": "Recommended",
+    "shipping_length": "Recommended",
+    "shipping_width": "Recommended",
+    "shipping_height": "Recommended",
+
     "google_product_category": "Mandatory",
 }
+
+# ---------------------------------------------------------------------------
+# 8)  Export Excel – Statuts & Récap
+# ---------------------------------------------------------------------------
 
 def generate_excel(data: list[dict]) -> BytesIO:
     wb = Workbook()
@@ -342,7 +368,7 @@ def generate_excel(data: list[dict]) -> BytesIO:
     return buf
 
 # ---------------------------------------------------------------------------
-# 7)  Interface Streamlit
+# 9)  Interface Streamlit
 # ---------------------------------------------------------------------------
 
 def main():
