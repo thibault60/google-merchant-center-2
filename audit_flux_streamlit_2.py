@@ -1,422 +1,70 @@
-import streamlit as st
-import requests
-from openpyxl import Workbook
-from openpyxl.styles import Font
-from io import BytesIO
+"""
+MaxWarehouse — Canonical Link Extractor
+Reads a TSV/TXT feed export, strips ?variant= params, and outputs an XLSX.
+
+Usage:
+    python extract_canonical_links.py input_feed.txt output_canonical.xlsx
+"""
+
 import re
-from decimal import Decimal, InvalidOperation
-from collections import defaultdict
+import csv
+import sys
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
 
-"""
-Audit d'un flux Google Merchant – version TXT pipe '|' ➜ EN
-===========================================================
-• Télécharge ou lit un TXT (lignes pipe-séparées).
-• Extrait les produits et alimente les attributs EN attendus.
-• Normalise prix, GTIN, dimensions.
-• Valide attributs clés avec logique adaptée (textiles vs apparel/electronics).
-• Exporte un rapport Excel, avec récap par statut (Mandatory/Recommended…).
-"""
 
-# ---------------------------------------------------------------------------
-# 1)  Helpers visuels
-# ---------------------------------------------------------------------------
+def extract_canonical(url):
+    """Remove ?variant=XXXXX from a product URL."""
+    return re.sub(r'\?variant=\d+', '', url)
 
-def add_custom_css():
-    st.markdown(
-        """
-        <style>
-        body {background-color:#f8f9fa;font-family:Arial, sans-serif;}
-        .main-title {color:#343a40;text-align:center;font-size:2.4rem;margin-bottom:1rem;}
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-# ---------------------------------------------------------------------------
-# 2)  Téléchargement / lecture TXT
-# ---------------------------------------------------------------------------
-
-def fetch_txt(url: str) -> bytes | None:
-    try:
-        r = requests.get(url, timeout=15)
-        r.raise_for_status()
-        return r.content
-    except requests.exceptions.RequestException as exc:
-        st.error(f"Erreur téléchargement : {exc}")
-        return None
-
-# ---------------------------------------------------------------------------
-# 3)  Normalisations
-# ---------------------------------------------------------------------------
-
-_PRICE_RE = re.compile(r"^(\d+[.,]?\d*)(?:\s*([A-Z]{3}))?$")
-_DIMENSION_RE = re.compile(r"^\d+(?:[.,]\d+)?\s?(?:mm|cm|in|kg|g)?$", re.I)
-
-def normalize_price(raw: str) -> str:
-    if not raw or raw == "MISSING":
-        return "MISSING"
-    m = _PRICE_RE.match(raw.strip())
-    if not m:
-        return raw.strip()
-    amount, currency = m.groups()
-    amount = amount.replace(",", ".")
-    try:
-        amount = f"{Decimal(amount):.2f}".rstrip("0").rstrip(".")
-    except InvalidOperation:
-        return raw.strip()
-    return f"{amount} {currency or 'EUR'}".strip()
-
-def normalize_gtin(raw: str) -> str:
-    if not raw or raw == "MISSING":
-        return "MISSING"
-    try:
-        val = int(Decimal(raw))
-        return f"{val:013d}"
-    except (InvalidOperation, ValueError):
-        return raw
-
-# ---------------------------------------------------------------------------
-# 4)  Colonnes exportées & Validation (ordre des colonnes Excel)
-# ---------------------------------------------------------------------------
-
-_PRODUCT_ATTRS = [
-    "id", "title", "link", "image_link", "price", "sale_price",
-    "description", "availability", "condition", "brand",
-    "gtin", "mpn", "color", "size", "age_group", "gender",
-    "item_group_id", "google_product_category",
-    # certification & dimensions
-    "certification_authority", "certification_name", "certification_code",
-    "product_length", "product_width", "product_height", "product_weight",
-    "shipping_length", "shipping_width", "shipping_height",
-    # autres
-    "shipping", "shipping_weight", "pattern", "material",
-    "additional_image_link", "size_type", "size_system", "canonical_link",
-    "expiration_date", "sale_price_effective_date", "product_highlight",
-    "ships_from_country", "minimum_handling_time", "max_handling_time",
-    "availability_date", "product_detail",
-]
-
-_VALIDATION_ATTRS = [
-    "duplicate_id", "invalid_or_missing_price", "null_price", "missing_title",
-    "description_missing_or_short", "invalid_availability", "missing_or_empty_color",
-    "missing_or_empty_gender", "missing_or_empty_size", "missing_or_empty_age_group",
-    "missing_or_empty_image_link", "missing_certification",
-    "missing_dimensions_weight", "invalid_dimension_format",
-    "missing_google_product_category", "missing_minimum_handling_time",
-]
-
-_HEADERS = _PRODUCT_ATTRS + _VALIDATION_ATTRS
-
-# ---------------------------------------------------------------------------
-# 5)  Extraction produits depuis un TXT pipe '|'
-#     (ignore les lignes d'en-tête + BOM)
-# ---------------------------------------------------------------------------
-
-def parse_txt(content: bytes) -> list[dict]:
-    text = content.decode("utf-8", errors="replace")
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
-    products: list[dict] = []
-
-    for ln in lines:
-        fields = ln.split("|")
-
-        # --- Détection et saut des en-têtes (case-insensitive) + gestion BOM ---
-        def low(i: int) -> str:
-            if i >= len(fields):
-                return ""
-            return fields[i].lstrip("\ufeff").strip().lower()
-
-        is_header = (
-            (low(0) in ("id", "g:id")) and
-            (low(1) in ("title", "g:title", "name")) and
-            (low(2) in ("link", "g:link")) and
-            (low(3) in ("image_link", "g:image_link", "price"))
-        )
-        if is_header:
-            continue
-        # ----------------------------------------------------------------------
-
-        # Initialise toutes les colonnes exportées à MISSING
-        prod = {key: "MISSING" for key in _PRODUCT_ATTRS}
-
-        def get(i: int) -> str:
-            return (fields[i].strip() if i < len(fields) else "")
-
-        # Mapping basé sur l'exemple :
-        # 0:id | 1:title | 2:link | 3:price | 4:description | 5:condition
-        # 6:gtin | 7:color | 8:mpn | 9:image_link
-        # 10:breadcrumb (ignoré) | 11:availability | 12:shipping | 13:shipping_weight | 14:gpc
-        # 15:breadcrumb2 (ignoré) | 16:item_group_id | 17:gender | 18:age_group | 19:pattern | 20:size
-        prod["id"]          = get(0) or "MISSING"
-        prod["title"]       = get(1) or "MISSING"
-        prod["link"]        = get(2) or "MISSING"
-        prod["price"]       = normalize_price(get(3) or "MISSING")
-        prod["description"] = get(4) or "MISSING"
-        prod["condition"]   = get(5) or "MISSING"
-        prod["gtin"]        = normalize_gtin(get(6) or "MISSING")
-        prod["color"]       = get(7) or "MISSING"
-        prod["mpn"]         = get(8) or "MISSING"
-        prod["image_link"]  = get(9) or "MISSING"
-        prod["availability"]= get(11) or "MISSING"
-        prod["shipping"]    = get(12) or "MISSING"
-        prod["shipping_weight"] = get(13) or "MISSING"
-        prod["google_product_category"] = get(14) or "MISSING"
-        prod["item_group_id"] = get(16) or "MISSING"
-        prod["gender"]      = get(17) or "MISSING"
-        prod["age_group"]   = get(18) or "MISSING"
-        prod["pattern"]     = get(19) or "MISSING"
-        prod["size"]        = get(20) or "MISSING"
-
-        # Brand : fallback si une colonne suivante contient une valeur pertinente
-        candidate_brand = get(21)
-        if candidate_brand and candidate_brand.lower() not in ("0", "na", "null"):
-            prod["brand"] = candidate_brand
-
-        # additional_image_link : cherche un champ avec URLs séparées par des virgules
-        if prod["additional_image_link"] == "MISSING":
-            for f in fields[22:]:
-                s = f.strip()
-                if "http" in s and "," in s:
-                    prod["additional_image_link"] = s
-                    break
-
-        # ships_from_country : dernier token 2–3 lettres majuscules (ex. FR)
-        for f in reversed(fields):
-            s = f.strip()
-            if len(s) in (2, 3) and s.isupper():
-                prod["ships_from_country"] = s
-                break
-
-        # Normalisations finales (sécurité)
-        prod["price"] = normalize_price(prod.get("price", "MISSING"))
-        prod["gtin"]  = normalize_gtin(prod.get("gtin", "MISSING"))
-
-        products.append(prod)
-
-    return products
-
-# ---------------------------------------------------------------------------
-# 6)  Validation (textiles par défaut ; règles strictes si apparel/électronique)
-# ---------------------------------------------------------------------------
-
-_PRICE_VALID_RE = re.compile(r"^\d+(?:\.\d{1,2})?\s?[A-Z]{3}$")
-
-def validate_products(products: list[dict]) -> list[dict]:
-    seen_ids: set[str] = set()
-    validated: list[dict] = []
-
-    for prod in products:
-        pid = prod["id"]
-        price = prod["price"]
-        desc  = prod["description"]
-
-        cat = (prod.get("google_product_category", "") or "").lower()
-        # Catégories où certains champs deviennent vraiment obligatoires
-        is_apparel = any(k in cat for k in [
-            "apparel", "clothing", "shoes", "accessories", "wear"
-        ])
-        is_electronics = any(k in cat for k in [
-            "electronic", "appliance", "camera", "computer", "phone", "tv", "audio"
-        ])
-
-        def missing(attr: str) -> bool:
-            return prod.get(attr) in ("", "MISSING")
-
-        dims_invalid = any(
-            not _DIMENSION_RE.match(prod[attr]) for attr in (
-                "product_length", "product_width", "product_height",
-                "shipping_length", "shipping_width", "shipping_height",
-                "product_weight",
-            ) if not missing(attr)
-        )
-
-        errors = {
-            "duplicate_id":                 "Erreur" if pid in seen_ids else "OK",
-            "invalid_or_missing_price":     "Erreur" if price == "MISSING" or not _PRICE_VALID_RE.match(price) else "OK",
-            "null_price":                   "Erreur" if price.startswith("0") else "OK",
-            "missing_title":                "Erreur" if prod["title"] == "MISSING" else "OK",
-            "description_missing_or_short": "Erreur" if len(desc) < 20 else "OK",
-            "invalid_availability":         "Erreur" if prod["availability"] == "MISSING" else "OK",
-
-            # Pour le linge de maison, non obligatoires (deviennent obligatoires en apparel)
-            "missing_or_empty_color":       "Erreur" if (is_apparel and missing("color")) else "OK",
-            "missing_or_empty_gender":      "Erreur" if (is_apparel and missing("gender")) else "OK",
-            "missing_or_empty_size":        "Erreur" if (is_apparel and missing("size")) else "OK",
-            "missing_or_empty_age_group":   "Erreur" if (is_apparel and missing("age_group")) else "OK",
-
-            "missing_or_empty_image_link":  "Erreur" if missing("image_link") else "OK",
-
-            # Certification & dimensions : exigées uniquement pour l'électronique
-            "missing_certification":        "Erreur" if (is_electronics and any(missing(a) for a in (
-                                                "certification_authority", "certification_name", "certification_code"
-                                              ))) else "OK",
-            "missing_dimensions_weight":    "Erreur" if (is_electronics and any(missing(a) for a in (
-                                                "product_length", "product_width", "product_height", "product_weight",
-                                                "shipping_length", "shipping_width", "shipping_height"
-                                              ))) else "OK",
-            "invalid_dimension_format":     "Erreur" if (is_electronics and dims_invalid) else "OK",
-
-            # Contrôles génériques
-            "missing_google_product_category": "Erreur" if missing("google_product_category") else "OK",
-            "missing_minimum_handling_time":   "Erreur" if missing("minimum_handling_time") else "OK",
-        }
-
-        validated.append({**prod, **errors})
-        seen_ids.add(pid)
-
-    return validated
-
-# ---------------------------------------------------------------------------
-# 7)  Table des statuts (adaptée Home Textiles)
-# ---------------------------------------------------------------------------
-
-FIELD_STATUS = {
-    "id": "Mandatory",
-    "title": "Mandatory",
-    "link": "Mandatory",
-    "image_link": "Mandatory",
-    "price": "Mandatory",
-    "description": "Mandatory",
-    "availability": "Mandatory",
-    "condition": "Mandatory IF SECOND-HAND or RECONDITIONED",
-    "brand": "Mandatory",
-    "gtin": "Mandatory if GTIN existing",
-    "mpn": "Mandatory if GTIN already exists",
-
-    # Textiles / linge de maison : utiles mais non obligatoires
-    "color": "Recommended for HOME TEXTILES",
-    "size": "Recommended for HOME TEXTILES",
-    "age_group": "Optional",
-    "gender": "Optional",
-
-    "item_group_id": "Mandatory FOR VARIANTS",
-    "shipping": "Mandatory if not configured in GMC",
-    "shipping_weight": "Recommended",
-
-    "pattern": "Recommended for HOME TEXTILES",
-    "material": "Recommended for HOME TEXTILES",
-
-    "additional_image_link": "Recommended",
-    "size_type": "Recommended for HOME TEXTILES",
-    "size_system": "Recommended for HOME TEXTILES",
-    "canonical_link": "Recommended",
-    "expiration_date": "Recommended to stop displaying a product",
-    "sale_price": "Recommended for promotions",
-    "sale_price_effective_date": "Recommended for promotions",
-    "product_highlight": "Recommended",
-    "ships_from_country": "Recommended",
-    "minimum_handling_time": "Recommended",
-    "max_handling_time": "Recommended",
-    "availability_date": "Mandatory if product is pre-ordered",
-
-    # Mentions supprimées (pas d'électronique ici)
-    "certification_authority": "Optional",
-    "certification_name": "Optional",
-    "certification_code": "Optional",
-    "product_detail": "Recommended",
-
-    # Dimensions/poids utiles pour la logistique
-    "product_length": "Recommended",
-    "product_width": "Recommended",
-    "product_height": "Recommended",
-    "product_weight": "Recommended",
-    "shipping_length": "Recommended",
-    "shipping_width": "Recommended",
-    "shipping_height": "Recommended",
-
-    "google_product_category": "Mandatory",
-}
-
-# ---------------------------------------------------------------------------
-# 8)  Export Excel – Statuts & Récap
-# ---------------------------------------------------------------------------
-
-def generate_excel(data: list[dict]) -> BytesIO:
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Validation"
-
-    # Feuille 1 : données + flags
-    ws.append(_HEADERS)
-    for c in ws[1]:
-        c.font = Font(bold=True)
-    for prod in data:
-        ws.append([prod.get(col, "") for col in _HEADERS])
-
-    # Feuille 2 : récap par attribut
-    recap = wb.create_sheet("Recap_Attributs")
-    recap.append(["Attribut", "Statut", "Présents", "Manquants", "% manquant"])
-    for c in recap[1]:
-        c.font = Font(bold=True)
-
-    total = len(data) or 1
-    by_status_counts = defaultdict(list)
-
-    for attr in _PRODUCT_ATTRS:
-        missing = sum(1 for p in data if p.get(attr) in ("", "MISSING"))
-        status = FIELD_STATUS.get(attr, "")
-        missing_pct = (missing / total) * 100
-        recap.append([attr, status, total - missing, missing, f"{missing_pct:.1f}"])
-        if status:
-            by_status_counts[status].append(100 - missing_pct)
-
-    # Feuille 3 : synthèse par statut
-    synth = wb.create_sheet("Synthese_par_statut")
-    synth.append(["Statut", "Nb attributs", "Taux de complétion moyen (%)", "Attributs"])
-    for c in synth[1]:
-        c.font = Font(bold=True)
-
-    for status, completion_list in by_status_counts.items():
-        attrs = [a for a, s in FIELD_STATUS.items() if s == status and a in _PRODUCT_ATTRS]
-        avg_completion = sum(completion_list) / len(completion_list) if completion_list else 0.0
-        synth.append([status, len(attrs), f"{avg_completion:.1f}", ", ".join(attrs)])
-
-    # Feuille 4 : règles (tableau brut des statuts)
-    rules = wb.create_sheet("Regles_Attributs")
-    rules.append(["Field Name", "Status"])
-    for c in rules[1]:
-        c.font = Font(bold=True)
-    for field, status in FIELD_STATUS.items():
-        rules.append([field, status])
-
-    buf = BytesIO()
-    wb.save(buf)
-    buf.seek(0)
-    return buf
-
-# ---------------------------------------------------------------------------
-# 9)  Interface Streamlit
-# ---------------------------------------------------------------------------
 
 def main():
-    add_custom_css()
-    st.markdown("<h1 class='main-title'>Audit Flux Google Merchant (TXT)</h1>", unsafe_allow_html=True)
+    if len(sys.argv) < 3:
+        print("Usage: python extract_canonical_links.py <input.txt> <output.xlsx>")
+        sys.exit(1)
 
-    url = st.text_input("Entrez l'URL du fichier TXT :")
-    uploaded_file = st.file_uploader("… ou téléchargez un fichier TXT :", type=["txt"])
+    input_file = sys.argv[1]
+    output_file = sys.argv[2]
 
-    if st.button("Auditer le flux"):
-        content = None
-        if url:
-            content = fetch_txt(url)
-        elif uploaded_file is not None:
-            content = uploaded_file.read()
+    # Read TSV input
+    rows = []
+    with open(input_file, 'r', encoding='utf-8') as f:
+        reader = csv.DictReader(f, delimiter='\t', quotechar='"')
+        for row in reader:
+            pid = row.get('id', '').strip('"')
+            link = row.get('link', '').strip('"')
+            if pid and link:
+                rows.append((pid, link, extract_canonical(link)))
 
-        if not content:
-            st.warning("Veuillez fournir une URL ou un fichier TXT.")
-            st.stop()
+    # Create XLSX
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Canonical Links"
 
-        products = parse_txt(content)
-        validated = validate_products(products)
-        xlsx = generate_excel(validated)
+    header_font = Font(bold=True, color="FFFFFF", name="Arial", size=10)
+    header_fill = PatternFill("solid", fgColor="2D5B2D")
+    header_align = Alignment(horizontal="center", vertical="center")
+    cell_font = Font(name="Arial", size=10)
 
-        st.success(f"Audit terminé : {len(products)} produit(s) analysé(s).")
-        st.download_button(
-            "Télécharger le rapport Excel",
-            data=xlsx,
-            file_name="audit_flux_google_merchant.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+    for col, h in enumerate(["id", "link", "canonical_link"], 1):
+        cell = ws.cell(row=1, column=col, value=h)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = header_align
+
+    for row_idx, (pid, link, canonical) in enumerate(rows, 2):
+        ws.cell(row=row_idx, column=1, value=pid).font = cell_font
+        ws.cell(row=row_idx, column=2, value=link).font = cell_font
+        ws.cell(row=row_idx, column=3, value=canonical).font = cell_font
+
+    ws.column_dimensions['A'].width = 18
+    ws.column_dimensions['B'].width = 95
+    ws.column_dimensions['C'].width = 85
+    ws.auto_filter.ref = f"A1:C{len(rows) + 1}"
+
+    wb.save(output_file)
+    print(f"Done — {len(rows)} products exported to {output_file}")
+
 
 if __name__ == "__main__":
     main()
