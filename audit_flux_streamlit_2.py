@@ -1,90 +1,131 @@
-"""
-merchant_feed_to_xlsx.py — Extraction du flux Merchant Center vers XLSX
-Glisse ton fichier CSV sur GLISSER_FEED_ICI.bat
-"""
-import sys
-import time
+import streamlit as st
+import pandas as pd
 import json
 import re
-from pathlib import Path
+from io import BytesIO
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
+st.set_page_config(page_title="Merchant Feed Extractor", page_icon="🛒", layout="wide")
 
+st.markdown("""
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&display=swap');
+    .block-container { max-width: 1200px; padding-top: 2rem; }
+    html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
+    .main-title { font-size: 2rem; font-weight: 700; color: #1a1a2e; margin-bottom: 0.2rem; }
+    .subtitle { font-size: 1rem; color: #6b7280; margin-bottom: 2rem; }
+    .metric-card {
+        background: linear-gradient(135deg, #eff6ff, #dbeafe);
+        border: 1px solid #bfdbfe; border-radius: 12px;
+        padding: 1.2rem; text-align: center;
+    }
+    .metric-card h3 { font-size: 1.8rem; color: #1e40af; margin: 0; }
+    .metric-card p { font-size: 0.82rem; color: #4b5563; margin: 0; }
+    .stDownloadButton > button {
+        background-color: #1e40af !important; color: white !important;
+        border-radius: 8px !important; padding: 0.6rem 2rem !important;
+        font-weight: 600 !important; width: 100% !important;
+    }
+    .tag { display:inline-block; padding:2px 10px; border-radius:99px; font-size:0.78rem; font-weight:600; margin:2px; }
+    .tag-blue { background:#dbeafe; color:#1e40af; }
+    .tag-brown { background:#fef3c7; color:#92400e; }
+    .tag-green { background:#d1fae5; color:#065f46; }
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown('<div class="main-title">🛒 Merchant Feed Extractor</div>', unsafe_allow_html=True)
+st.markdown('<div class="subtitle">Feedonomics / MaxWarehouse — Extrait les attributs du flux en colonnes Excel structurées</div>', unsafe_allow_html=True)
+
+# ── Helpers ──
 def extract_metafields(json_str):
-    """Extrait les metafields product_meta en colonnes clé→valeur."""
     try:
         items = json.loads(json_str)
         return {item["namespace"] + "." + item["key"]: item["value"] for item in items if isinstance(item, dict)}
     except Exception:
         return {}
 
-
 def extract_publications(json_str):
-    """Retourne les noms des publications séparés par | ."""
     try:
         items = json.loads(json_str)
-        return " | ".join(item["name"] for item in items if isinstance(item, dict) and "name" in item)
+        return " | ".join(i["name"] for i in items if isinstance(i, dict) and "name" in i)
     except Exception:
-        return json_str
-
+        return ""
 
 def extract_variant_names(json_str):
-    """Retourne les noms de variantes ex: Color: Red | Size: L"""
     try:
         d = json.loads(json_str)
         return " | ".join(f"{k}: {v}" for k, v in d.items())
     except Exception:
-        return json_str
-
+        return ""
 
 def clean_description(text):
-    """Supprime le balisage markdown basique des descriptions."""
     if not isinstance(text, str):
-        return text
+        return ""
     text = re.sub(r"\* ", "", text)
     text = re.sub(r"\n+", " / ", text)
     return text.strip(" /")
 
+# ── Sidebar ──
+with st.sidebar:
+    st.header("⚙️ Configuration")
+    separator = st.selectbox("Séparateur", ["Virgule (,)", "Tab (\\t)", "Point-virgule (;)"], index=0)
+    sep_map = {"Virgule (,)": ",", "Tab (\\t)": "\t", "Point-virgule (;)": ";"}
+    sep_char = sep_map[separator]
 
-def main():
-    if len(sys.argv) < 2:
-        input("❌ Utilisation : glisse ton fichier CSV sur GLISSER_FEED_ICI.bat\n\nAppuie sur Entrée pour fermer...")
-        sys.exit(1)
+    st.divider()
+    st.markdown("**Options d'extraction**")
+    opt_meta     = st.checkbox("Extraire les metafields", value=True)
+    opt_pub      = st.checkbox("Décomposer publications", value=True)
+    opt_variants = st.checkbox("Nettoyer variant_names", value=True)
+    opt_desc     = st.checkbox("Nettoyer descriptions", value=True)
+    opt_es       = st.checkbox("Inclure colonnes ES (espagnol)", value=False)
 
-    input_path = Path(sys.argv[1])
-    if not input_path.exists():
-        input(f"❌ Fichier introuvable : {input_path}\n\nAppuie sur Entrée pour fermer...")
-        sys.exit(1)
+    st.divider()
+    st.markdown("**Légende couleurs Excel**")
+    st.markdown('<span class="tag tag-blue">🔵 Attributs MC</span>', unsafe_allow_html=True)
+    st.markdown('<span class="tag tag-brown">🟤 Metafields</span>', unsafe_allow_html=True)
+    st.markdown('<span class="tag tag-green">🟢 Espagnol</span>', unsafe_allow_html=True)
 
-    output_path = input_path.with_stem(input_path.stem + "_extracted").with_suffix(".xlsx")
+# ── Upload ──
+uploaded = st.file_uploader("📂 Importe ton flux Feedonomics (CSV / TSV)", type=["csv", "tsv", "txt"])
 
-    print(f"\n📂 Source  : {input_path.name}  ({input_path.stat().st_size / 1e6:.1f} Mo)")
-    print(f"📊 Cible   : {output_path.name}")
-    print(f"\n⏳ Lecture du fichier...\n")
+if uploaded:
+    with st.spinner("Lecture du fichier..."):
+        try:
+            df = pd.read_csv(uploaded, sep=sep_char, dtype=str, encoding="utf-8-sig", on_bad_lines="skip", low_memory=False)
+            df.columns = df.columns.str.strip().str.strip('"').str.lower()
+            df = df.fillna("")
+        except Exception as e:
+            st.error(f"Erreur de lecture : {e}")
+            st.stop()
 
-    try:
-        import pandas as pd
-        from openpyxl import Workbook
-        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-        from openpyxl.utils import get_column_letter
-    except ImportError as e:
-        input(f"\n❌ Module manquant : {e}\nLance : pip install pandas openpyxl\n\nAppuie sur Entrée pour fermer...")
-        sys.exit(1)
+    total_rows, total_cols = df.shape
 
-    t0 = time.time()
+    # ── Transformations ──
+    with st.spinner("Transformation des colonnes..."):
 
-    # ── Lecture ──
-    df = pd.read_csv(
-        input_path,
-        dtype=str,
-        encoding="utf-8-sig",
-        on_bad_lines="skip",
-        low_memory=False,
-    )
-    df.columns = df.columns.str.strip().str.strip('"').str.lower()
-    df = df.fillna("")
-    print(f"  ✅ {len(df):,} lignes × {len(df.columns)} colonnes lues")
+        if opt_desc and "description" in df.columns:
+            df["description"] = df["description"].apply(clean_description)
+        if opt_desc and "es_body_html" in df.columns:
+            df["es_body_html"] = df["es_body_html"].apply(clean_description)
 
-    # ── Colonnes principales à conserver ──
+        if opt_pub and "publications" in df.columns:
+            df["publications_names"] = df["publications"].apply(extract_publications)
+
+        if opt_variants and "variant_names" in df.columns:
+            df["variant_names_clean"] = df["variant_names"].apply(extract_variant_names)
+
+        meta_cols = []
+        if opt_meta and "product_meta" in df.columns:
+            meta_extracted = df["product_meta"].apply(extract_metafields)
+            meta_df = pd.DataFrame(meta_extracted.tolist()).fillna("")
+            meta_df.columns = ["meta." + c for c in meta_df.columns]
+            meta_cols = list(meta_df.columns)
+            df = pd.concat([df.reset_index(drop=True), meta_df.reset_index(drop=True)], axis=1)
+
+    # ── Construction colonnes finales ──
     CORE_COLS = [
         "id", "item_group_id", "sku", "gtin",
         "parent_title", "child_title",
@@ -95,184 +136,164 @@ def main():
         "color", "size", "material",
         "weight", "weight_unit", "shipping_weight",
         "taxable", "requires_shipping", "fulfillment_service",
-        "published_status",
-        "custom_collections_title",
-        "smart_collections_title",
-        "tags",
+        "published_status", "tags",
+        "custom_collections_title", "smart_collections_title",
     ]
-
     present_core = [c for c in CORE_COLS if c in df.columns]
 
-    # ── Nettoyage colonnes texte lourdes ──
-    for col in ["description", "es_body_html"]:
-        if col in df.columns:
-            df[col] = df[col].apply(clean_description)
+    extra = []
+    if "publications_names" in df.columns:  extra.append("publications_names")
+    if "variant_names_clean" in df.columns: extra.append("variant_names_clean")
+    if "description" in df.columns:         extra.append("description")
 
-    # ── Publications → noms lisibles ──
-    if "publications" in df.columns:
-        df["publications_names"] = df["publications"].apply(extract_publications)
+    es_cols = [c for c in df.columns if c.startswith("es_")] if opt_es else []
 
-    # ── variant_names → lisible ──
-    if "variant_names" in df.columns:
-        df["variant_names_clean"] = df["variant_names"].apply(extract_variant_names)
-
-    # ── Extraction metafields product_meta ──
-    meta_cols_data = []
-    if "product_meta" in df.columns:
-        print("  🔍 Extraction des metafields product_meta...")
-        meta_extracted = df["product_meta"].apply(extract_metafields)
-        meta_df = pd.DataFrame(meta_extracted.tolist()).fillna("")
-        # Préfixer les colonnes
-        meta_df.columns = ["meta." + c for c in meta_df.columns]
-        meta_cols_data = list(meta_df.columns)
-        df = pd.concat([df.reset_index(drop=True), meta_df.reset_index(drop=True)], axis=1)
-        print(f"  ✅ {len(meta_cols_data)} metafields extraits : {', '.join(meta_cols_data[:6])}{'...' if len(meta_cols_data) > 6 else ''}")
-
-    # ── Colonnes ES (traductions espagnol) ──
-    es_cols = [c for c in df.columns if c.startswith("es_")]
-
-    # ── Ordre final des colonnes ──
-    extra_cols = []
-    if "publications_names" in df.columns:
-        extra_cols.append("publications_names")
-    if "variant_names_clean" in df.columns:
-        extra_cols.append("variant_names_clean")
-    if "description" in df.columns:
-        extra_cols.append("description")
-
-    final_cols = present_core + extra_cols + meta_cols_data + es_cols
-
-    # Dédupliquer en conservant l'ordre
+    all_cols = present_core + extra + meta_cols + es_cols
     seen = set()
-    final_cols = [c for c in final_cols if not (c in seen or seen.add(c))]
-
+    final_cols = [c for c in all_cols if not (c in seen or seen.add(c))]
     df_out = df[final_cols]
-    print(f"\n  📋 {len(final_cols)} colonnes dans le fichier final")
 
-    # ── Écriture XLSX ──
-    print(f"\n⏳ Écriture du fichier Excel ({len(df_out):,} lignes)...")
+    # ── Métriques ──
+    st.markdown("---")
+    c1, c2, c3, c4 = st.columns(4)
+    with c1: st.markdown(f'<div class="metric-card"><h3>{total_rows:,}</h3><p>Produits</p></div>', unsafe_allow_html=True)
+    with c2: st.markdown(f'<div class="metric-card"><h3>{len(present_core)}</h3><p>Attributs MC</p></div>', unsafe_allow_html=True)
+    with c3: st.markdown(f'<div class="metric-card"><h3>{len(meta_cols)}</h3><p>Metafields</p></div>', unsafe_allow_html=True)
+    with c4: st.markdown(f'<div class="metric-card"><h3>{len(final_cols)}</h3><p>Colonnes totales</p></div>', unsafe_allow_html=True)
 
-    CHUNK     = 50_000
-    MAX_ROWS  = 1_048_575
-    HDR_CLR   = "1e3a8a"
-    EVEN_CLR  = "EFF6FF"
-    META_CLR  = "fef9c3"   # jaune pâle pour metafields
-    ES_CLR    = "f0fdf4"   # vert pâle pour colonnes ES
+    st.markdown("---")
 
-    wb = Workbook()
-    if "Sheet" in wb.sheetnames:
-        del wb["Sheet"]
+    # ── Tabs aperçu ──
+    tab1, tab2, tab3 = st.tabs(["📋 Attributs principaux", "🔍 Metafields", "📊 Toutes les colonnes"])
 
-    thin   = Side(style="thin", color="D1D5DB")
-    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    with tab1:
+        preview_cols = [c for c in present_core + extra if c in df_out.columns]
+        st.dataframe(df_out[preview_cols].head(100), use_container_width=True, height=380)
 
-    def get_header_fill(col_name):
-        if col_name.startswith("meta."):
-            return PatternFill("solid", fgColor="92400e")  # brun
-        if col_name.startswith("es_"):
-            return PatternFill("solid", fgColor="065f46")  # vert foncé
-        return PatternFill("solid", fgColor=HDR_CLR)
+    with tab2:
+        if meta_cols:
+            id_col = ["id"] if "id" in df_out.columns else []
+            st.dataframe(df_out[id_col + meta_cols].head(100), use_container_width=True, height=380)
+        else:
+            st.info("Aucun metafield extrait (option désactivée ou colonne absente).")
 
-    def get_row_fill(col_name, ri):
-        if col_name.startswith("meta."):
-            return PatternFill("solid", fgColor=META_CLR if ri % 2 == 0 else "fffbeb")
-        if col_name.startswith("es_"):
-            return PatternFill("solid", fgColor=ES_CLR if ri % 2 == 0 else "f7fef9")
-        return PatternFill("solid", fgColor=EVEN_CLR if ri % 2 == 0 else "FFFFFF")
+    with tab3:
+        st.dataframe(df_out.head(50), use_container_width=True, height=380)
 
-    sheet_index = 1
-    total_written = 0
-    batch = []
+    # ── Build XLSX ──
+    st.markdown("---")
+    st.subheader("📥 Export")
 
-    def flush(rows, name):
-        ws = wb.create_sheet(title=name)
-        # En-tête
-        for ci, col in enumerate(final_cols, 1):
-            cell = ws.cell(row=1, column=ci, value=col)
-            cell.font      = Font(name="Arial", bold=True, color="FFFFFF", size=10)
-            cell.fill      = get_header_fill(col)
-            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-            cell.border    = border
-        ws.row_dimensions[1].height = 32
-        ws.freeze_panes = "A2"
+    with st.spinner("Génération du fichier Excel..."):
+        HDR_BLUE  = "1e3a8a"
+        HDR_BROWN = "92400e"
+        HDR_GREEN = "065f46"
+        EVEN_BLUE  = "EFF6FF"
+        EVEN_AMBER = "fffbeb"
+        EVEN_GREEN = "f0fdf4"
 
-        data_font = Font(name="Arial", size=10)
-        for ri, row in enumerate(rows, 2):
-            for ci, (col, val) in enumerate(zip(final_cols, row), 1):
-                cell           = ws.cell(row=ri, column=ci, value=val)
-                cell.font      = data_font
-                cell.fill      = get_row_fill(col, ri)
-                cell.border    = border
-                cell.alignment = Alignment(vertical="center", wrap_text=False)
+        thin   = Side(style="thin", color="D1D5DB")
+        border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-        # Largeurs par type de colonne
-        width_map = {
-            "id": 14, "item_group_id": 14, "sku": 14, "gtin": 16,
-            "parent_title": 45, "child_title": 45,
-            "brand": 16, "product_type": 20,
-            "price": 10, "sale_price": 10, "availability": 14,
-            "link": 60, "image_link": 60, "additional_image_link": 40,
-            "color": 14, "size": 12, "material": 16,
-            "description": 70, "publications_names": 50,
-            "variant_names_clean": 25,
+        def col_hdr_color(col):
+            if col.startswith("meta."): return HDR_BROWN
+            if col.startswith("es_"):   return HDR_GREEN
+            return HDR_BLUE
+
+        def col_row_fill(col, ri):
+            even = ri % 2 == 0
+            if col.startswith("meta."): return EVEN_AMBER if even else "fef9c3"
+            if col.startswith("es_"):   return EVEN_GREEN if even else "f7fef9"
+            return EVEN_BLUE if even else "FFFFFF"
+
+        COL_WIDTHS = {
+            "id":14,"item_group_id":14,"sku":14,"gtin":16,
+            "parent_title":45,"child_title":45,"brand":16,"product_type":20,
+            "price":10,"sale_price":10,"availability":14,
+            "inventory_quantity":12,"inventory_management":18,"inventory_policy":16,
+            "link":60,"image_link":55,"additional_image_link":40,
+            "color":14,"size":12,"material":16,
+            "weight":10,"weight_unit":10,"shipping_weight":14,
+            "published_status":14,"tags":35,
+            "custom_collections_title":35,"smart_collections_title":35,
+            "publications_names":50,"variant_names_clean":25,"description":70,
         }
-        for ci, col in enumerate(final_cols, 1):
-            if col in width_map:
-                w = width_map[col]
-            elif col.startswith("meta."):
-                w = 22
-            elif col.startswith("es_"):
-                w = 35
-            else:
-                w = 18
-            ws.column_dimensions[get_column_letter(ci)].width = min(w, 80)
 
-    for _, row_data in df_out.iterrows():
-        batch.append(list(row_data))
-        total_written += 1
-        if len(batch) >= MAX_ROWS:
-            name = f"Data_{sheet_index}"
-            flush(batch, name)
-            print(f"  ✅ Feuille '{name}' ({len(batch):,} lignes)")
-            sheet_index += 1
-            batch = []
-        if total_written % 10_000 == 0:
-            print(f"  ↳ {total_written:>10,} lignes traitées...", end="\r")
+        MAX_ROWS = 1_048_575
+        wb = Workbook()
+        if "Sheet" in wb.sheetnames: del wb["Sheet"]
 
-    if batch:
-        name = "Data" if sheet_index == 1 else f"Data_{sheet_index}"
-        flush(batch, name)
+        sheet_idx   = 1
+        batch       = []
+        sheets_made = 0
 
-    # ── Feuille légende ──
-    ws_legend = wb.create_sheet(title="Légende")
-    ws_legend["A1"] = "Couleur"
-    ws_legend["B1"] = "Type de colonne"
-    for cell in ws_legend["1:1"]:
-        cell.font = Font(name="Arial", bold=True, size=11)
+        def flush(rows, name):
+            ws = wb.create_sheet(title=name)
+            for ci, col in enumerate(final_cols, 1):
+                cell = ws.cell(row=1, column=ci, value=col)
+                cell.font      = Font(name="Arial", bold=True, color="FFFFFF", size=10)
+                cell.fill      = PatternFill("solid", fgColor=col_hdr_color(col))
+                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                cell.border    = border
+            ws.row_dimensions[1].height = 32
+            ws.freeze_panes = "A2"
 
-    legend = [
-        ("1e3a8a", "Attributs Merchant Center principaux"),
-        ("92400e", "Metafields produit (product_meta.*)"),
-        ("065f46", "Attributs espagnol (es_*)"),
-    ]
-    for ri, (color, label) in enumerate(legend, 2):
-        c = ws_legend.cell(row=ri, column=1, value="")
-        c.fill = PatternFill("solid", fgColor=color)
-        ws_legend.cell(row=ri, column=2, value=label).font = Font(name="Arial", size=10)
-    ws_legend.column_dimensions["A"].width = 6
-    ws_legend.column_dimensions["B"].width = 45
+            data_font = Font(name="Arial", size=10)
+            for ri, row in enumerate(rows, 2):
+                for ci, (col, val) in enumerate(zip(final_cols, row), 1):
+                    cell = ws.cell(row=ri, column=ci, value=val)
+                    cell.font      = data_font
+                    cell.fill      = PatternFill("solid", fgColor=col_row_fill(col, ri))
+                    cell.border    = border
+                    cell.alignment = Alignment(vertical="center")
 
-    wb.save(output_path)
+            for ci, col in enumerate(final_cols, 1):
+                w = COL_WIDTHS.get(col, 22 if col.startswith("meta.") else 35 if col.startswith("es_") else 18)
+                ws.column_dimensions[get_column_letter(ci)].width = min(w, 80)
 
-    elapsed = time.time() - t0
-    size_mb = output_path.stat().st_size / 1e6
-    print(f"\n\n{'─'*50}")
-    print(f"✅ Terminé en {elapsed:.0f}s")
-    print(f"   {total_written:,} produits  •  {len(final_cols)} colonnes  •  {size_mb:.1f} Mo")
-    print(f"   Fichier : {output_path.name}")
-    print(f"{'─'*50}\n")
-    input("Appuie sur Entrée pour fermer...")
+        for _, row_data in df_out.iterrows():
+            batch.append(list(row_data))
+            if len(batch) >= MAX_ROWS:
+                name = f"Data_{sheet_idx}"
+                flush(batch, name)
+                sheet_idx += 1
+                sheets_made += 1
+                batch = []
 
+        if batch:
+            flush(batch, "Data" if sheet_idx == 1 else f"Data_{sheet_idx}")
 
-if __name__ == "__main__":
-    main()
+        # Feuille légende
+        ws_l = wb.create_sheet("Légende")
+        legend = [("Attributs Merchant Center", HDR_BLUE), ("Metafields (meta.*)", HDR_BROWN), ("Espagnol (es_*)", HDR_GREEN)]
+        ws_l["A1"] = "Couleur"; ws_l["B1"] = "Type"
+        for c in ws_l["1:1"]: c.font = Font(name="Arial", bold=True)
+        for ri, (label, clr) in enumerate(legend, 2):
+            ws_l.cell(row=ri, column=1).fill = PatternFill("solid", fgColor=clr)
+            ws_l.cell(row=ri, column=2, value=label).font = Font(name="Arial", size=10)
+        ws_l.column_dimensions["A"].width = 5
+        ws_l.column_dimensions["B"].width = 35
+
+        output = BytesIO()
+        wb.save(output)
+        output.seek(0)
+
+    fname = uploaded.name.rsplit(".", 1)[0] + "_extracted.xlsx"
+    st.download_button(
+        label=f"⬇️ Télécharger {fname}",
+        data=output,
+        file_name=fname,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+else:
+    st.markdown("---")
+    st.info("👆 Importe ton fichier flux Feedonomics pour commencer.")
+    with st.expander("📖 Ce que fait ce script"):
+        st.markdown("""
+- **Attributs MC** : id, sku, gtin, titres, prix, dispo, liens images, couleur, taille, stock…
+- **Metafields** : le champ `product_meta` (JSON) est décomposé en colonnes `meta.namespace.key`
+- **Publications** : le JSON `publications` devient une liste lisible `Online Store | Google & YouTube…`
+- **Descriptions** : nettoyage du balisage markdown
+- **Colonnes ES** : traductions espagnol incluses en option
+        """)
